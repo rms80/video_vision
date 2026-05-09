@@ -28,6 +28,7 @@ BASE_DEPS = [
     "transformers",
     "huggingface_hub",
     "tqdm",
+    "ultralytics>=8.4.37",
 ]
 
 
