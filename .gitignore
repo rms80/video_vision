@@ -8,4 +8,5 @@ models/
 *.log
 *.pt
 __pycache__/
+.claude/
 .DS_Store
