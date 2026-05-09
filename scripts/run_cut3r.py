@@ -24,8 +24,8 @@ import numpy as np
 import torch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))
-CUT3R_ROOT = os.path.join(REPO_ROOT, "cut3r")
+REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+CUT3R_ROOT = os.path.join(REPO_ROOT, "models", "external", "cut3r")
 CUT3R_SRC = os.path.join(CUT3R_ROOT, "src")
 CUT3R_CKPT = os.path.join(CUT3R_SRC, "cut3r_512_dpt_4_64.pth")
 

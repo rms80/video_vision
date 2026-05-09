@@ -16,9 +16,8 @@ import torch
 from ultralytics.models.sam import SAM3SemanticPredictor
 from huggingface_hub import hf_hub_download
 
-# Resolve weights path relative to this script: segviewer/scripts/../../weights/sam3.pt
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WEIGHTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "weights"))
+WEIGHTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "models", "weights"))
 WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "sam3.pt")
 
 

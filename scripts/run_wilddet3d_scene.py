@@ -30,7 +30,7 @@ import torch
 from tqdm import tqdm
 
 WILDDET3D_ROOT = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "wilddet3d")
+    os.path.join(os.path.dirname(__file__), "..", "models", "external", "wilddet3d")
 )
 sys.path.insert(0, WILDDET3D_ROOT)
 sys.path.insert(0, os.path.join(WILDDET3D_ROOT, "third_party", "sam3"))

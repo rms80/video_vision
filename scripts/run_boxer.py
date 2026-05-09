@@ -32,7 +32,7 @@ import torch
 from tqdm import tqdm
 
 # Add Boxer repo to path
-BOXER_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "boxer"))
+BOXER_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "models", "external", "boxer"))
 sys.path.insert(0, BOXER_ROOT)
 
 from boxernet.boxernet import BoxerNet

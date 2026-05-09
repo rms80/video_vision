@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 # Add WildDet3D repo to path
 WILDDET3D_ROOT = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "wilddet3d")
+    os.path.join(os.path.dirname(__file__), "..", "models", "external", "wilddet3d")
 )
 sys.path.insert(0, WILDDET3D_ROOT)
 # WildDet3D's submodules

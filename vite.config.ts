@@ -19,7 +19,7 @@ const SCRIPTS_DIR = path.resolve(__dirname, "scripts");
 // at <venv>/Scripts/python.exe; on Linux/macOS it's <venv>/bin/python.
 const VENV_PYTHON = path.resolve(
   __dirname,
-  "..",
+  "models",
   ".venv",
   process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
 );
@@ -106,18 +106,29 @@ function runPython(script: string, args: string[], logPath: string, pythonExe: s
   return new Promise((resolve, reject) => {
     const fd = fs.openSync(logPath, "a");
     fs.writeSync(fd, `\n===== ${new Date().toISOString()} ${pythonExe} ${script} ${args.join(" ")} =====\n`);
+    // Spawn failures (e.g. ENOENT for a missing venv) emit BOTH 'error' and 'close',
+    // so guard against double-settle and double-close — otherwise closeSync on a
+    // freed fd throws EBADF and crashes the dev server.
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      try { fs.closeSync(fd); } catch {}
+      fn();
+    };
     const py = spawn(pythonExe, [script, ...args], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
-    py.stdout.on("data", (c: Buffer) => fs.writeSync(fd, c));
-    py.stderr.on("data", (c: Buffer) => fs.writeSync(fd, c));
-    py.on("close", (code) => {
-      fs.closeSync(fd);
+    py.stdout.on("data", (c: Buffer) => { try { fs.writeSync(fd, c); } catch {} });
+    py.stderr.on("data", (c: Buffer) => { try { fs.writeSync(fd, c); } catch {} });
+    py.on("close", (code) => finish(() => {
       if (code === 0) resolve();
       else reject(new Error(`${path.basename(script)} exit ${code} (see ${logPath})`));
-    });
-    py.on("error", (err) => {
-      try { fs.closeSync(fd); } catch {}
-      reject(err);
-    });
+    }));
+    py.on("error", (err: NodeJS.ErrnoException) => finish(() => {
+      const msg = err?.code === "ENOENT"
+        ? `python not found at ${pythonExe} — check the venv setup`
+        : err?.message ?? String(err);
+      reject(new Error(msg));
+    }));
   });
 }
 

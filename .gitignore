@@ -4,6 +4,7 @@ dist/
 uploads/
 tmp/
 analysis/
+models/
 *.log
 *.pt
 .DS_Store

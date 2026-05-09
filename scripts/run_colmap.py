@@ -33,8 +33,8 @@ import cv2
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))
-COLMAP_BAT = os.path.join(REPO_ROOT, "tools", "colmap", "COLMAP.bat")
+REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+COLMAP_BAT = os.path.join(REPO_ROOT, "models", "tools", "colmap", "COLMAP.bat")
 
 
 def run(cmd, cwd=None):

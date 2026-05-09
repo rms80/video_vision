@@ -35,8 +35,8 @@ import numpy as np
 import torch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))
-VGGT_ROOT = os.path.join(REPO_ROOT, "vggt")
+REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+VGGT_ROOT = os.path.join(REPO_ROOT, "models", "external", "vggt")
 
 
 # ---------------------------------------------------------------------------

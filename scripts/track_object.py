@@ -24,7 +24,7 @@ import torch
 from ultralytics.models.sam import SAM2VideoPredictor
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WEIGHTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "weights"))
+WEIGHTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "models", "weights"))
 MODEL_NAME = "sam2.1_l.pt"
 WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, MODEL_NAME)
 
@@ -67,7 +67,7 @@ def main():
 
     os.makedirs(WEIGHTS_DIR, exist_ok=True)
     # Ultralytics resolves bare filenames against its model hub and caches locally;
-    # passing an absolute path lets us keep the weights under ../../weights/.
+    # passing an absolute path lets us keep the weights under models/weights/.
     model_arg = WEIGHTS_PATH if os.path.exists(WEIGHTS_PATH) else MODEL_NAME
 
     predictor = SAM2VideoPredictor(overrides=dict(
