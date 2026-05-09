@@ -1,0 +1,1093 @@
+import { onMount, onCleanup, createEffect, on } from "solid-js";
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { parseNpz } from "./npz";
+import { buildDepthMesh, type CamerasJson, type CameraFrame } from "./depthMesh";
+import { buildPointCloud, buildScenePointCloud } from "./pointcloudMesh";
+import { getScenePluginOrDefault } from "./scenePlugins";
+
+export interface BoxerBox {
+  center: number[];
+  size: number[];
+  R: number[][];
+  t: number[];
+  corners: number[][];
+  confidence: number;
+}
+
+export interface BoxerFrame {
+  frame: number;
+  colmap_frame: number;
+  boxes: BoxerBox[];
+}
+
+export interface BoxerResult {
+  label: string;
+  gravity: number[];
+  frames: BoxerFrame[];
+  fused_boxes?: BoxerBox[];
+  num_frames_with_boxes?: number;
+}
+
+export interface ThreeDepthViewerProps {
+  videoName: string | null;
+  currentFrame: number;
+  depthFrames: number[];
+  depthStem: string;
+  cameras: CamerasJson | null;
+  visible: boolean;
+  downsample?: number;
+  boxerResult: BoxerResult | null;
+  wilddetResult: BoxerResult | null;
+  dataVersion?: number;
+  sceneSource?: string;
+  usePointmap?: boolean;
+  scenePointmapMode?: boolean;
+  showCameraPath?: boolean;
+  onReady?: (actions: { snapCamera: () => void; fitAll: () => void }) => void;
+}
+
+interface CachedEntry {
+  object: THREE.Mesh | THREE.Points;
+  frameIdx: number;
+  isPointCloud: boolean;
+}
+
+export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
+  let containerEl!: HTMLDivElement;
+  let renderer: THREE.WebGLRenderer | null = null;
+  let scene: THREE.Scene | null = null;
+  let camera: THREE.PerspectiveCamera | null = null;
+  let controls: OrbitControls | null = null;
+  let animId: number | null = null;
+  let resizeObs: ResizeObserver | null = null;
+
+  // Mesh cache — maps depth frame index to cached entry (mesh or point cloud)
+  const meshCache = new Map<number, CachedEntry>();
+  let currentShownFrame: number | null = null;
+  // Track loading to avoid double-fetching
+  const loadingFrames = new Set<number>();
+
+  // Scene-level pointmap (global reconstruction)
+  let scenePointmapObj: THREE.Points | null = null;
+  let scenePointmapLoading = false;
+
+  // Camera path visualization
+  let cameraPathLine: THREE.Line | null = null;
+  let cameraMarker: THREE.Mesh | null = null;
+  let cameraFrustums: THREE.LineSegments[] = [];
+  // Map frame idx → index into the path points array
+  let cameraPathFrameIndices: Map<number, number> = new Map();
+  let cameraWorldPositions: THREE.Vector3[] = [];
+
+  function nearestDepthFrame(frame: number): number | null {
+    const frames = props.depthFrames;
+    if (!frames.length) return null;
+    let best = frames[0];
+    let bestDist = Math.abs(frame - best);
+    for (const f of frames) {
+      const d = Math.abs(frame - f);
+      if (d < bestDist) { best = f; bestDist = d; }
+    }
+    return best;
+  }
+
+  function findCameraFrame(idx: number): CameraFrame | null {
+    if (!props.cameras) return null;
+    return props.cameras.frames.find((f) => f.idx === idx && f.registered && f.R && f.t) ?? null;
+  }
+
+  async function loadAndShowFrame(depthIdx: number) {
+    if (!scene || !props.cameras) return;
+
+    // Already cached?
+    const cached = meshCache.get(depthIdx);
+    if (cached) {
+      showOnlyMesh(depthIdx);
+      return;
+    }
+
+    if (loadingFrames.has(depthIdx)) return;
+    loadingFrames.add(depthIdx);
+
+    try {
+      const stem = props.depthStem;
+      const padded = String(depthIdx).padStart(6, "0");
+      const camFrame = findCameraFrame(depthIdx);
+      if (!camFrame || !camFrame.R || !camFrame.t) return;
+
+      const plugin = getScenePluginOrDefault(props.sceneSource);
+      if (props.usePointmap && plugin.features?.pointmap) {
+        // --- Pointmap path: load raw 3D points, render as THREE.Points ---
+        // Pointmap .npz lives next to the plugin's cameras.json, in a
+        // "pointmap" sibling of its depthDir.
+        const pmResp = await fetch(`/analysis/${stem}/_scene/${plugin.camerasDir}/pointmap/${padded}.npz`);
+        if (!pmResp.ok) return;
+        const pmBuf = await pmResp.arrayBuffer();
+        const arrays = await parseNpz(pmBuf);
+        const pts3dArr = arrays["pts3d"];
+        const confArr = arrays["conf"];
+        if (!pts3dArr || !confArr) return;
+
+        const [h, w] = confArr.shape;
+        const downsample = props.downsample ?? 2;
+        const result = buildPointCloud(
+          new Float32Array(pts3dArr.data),
+          new Float32Array(confArr.data),
+          w, h,
+          camFrame.R,
+          camFrame.t,
+          downsample,
+        );
+
+        if (result.pointCount === 0) return;
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(result.positions, 3));
+        geometry.setAttribute("color", new THREE.BufferAttribute(result.colors, 3));
+        geometry.computeBoundingBox();
+
+        // Scale point size relative to the cloud extent
+        const bbox = geometry.boundingBox!;
+        const extent = bbox.getSize(new THREE.Vector3());
+        const pointSize = Math.max(extent.x, extent.y, extent.z) * 0.003;
+
+        const material = new THREE.PointsMaterial({
+          size: pointSize,
+          vertexColors: true,
+          sizeAttenuation: true,
+        });
+        const points = new THREE.Points(geometry, material);
+        points.visible = false;
+
+        // Bounding box wireframe
+        const boxHelper = new THREE.Box3Helper(bbox, new THREE.Color(0x888888));
+        points.add(boxHelper);
+
+        scene!.add(points);
+        meshCache.set(depthIdx, { object: points, frameIdx: depthIdx, isPointCloud: true });
+      } else {
+        // --- Depth mesh path: load depth, unproject through K, render as triangle mesh ---
+        const depthResp = await fetch(`/analysis/${stem}/_scene/${plugin.depthDir}/${padded}.npz`);
+        if (!depthResp.ok) return;
+        const depthBuf = await depthResp.arrayBuffer();
+        const arrays = await parseNpz(depthBuf);
+        const depthArr = arrays["depth"];
+        if (!depthArr) return;
+        const [h, w] = depthArr.shape;
+
+        const downsample = props.downsample ?? 4;
+        const result = buildDepthMesh(
+          new Float32Array(depthArr.data),
+          w, h,
+          props.cameras.K,
+          camFrame.R,
+          camFrame.t,
+          downsample,
+        );
+
+        if (result.triangleCount === 0) return;
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(result.positions, 3));
+        geometry.setAttribute("uv", new THREE.BufferAttribute(result.uvs, 2));
+        geometry.setIndex(new THREE.BufferAttribute(result.indices, 1));
+        geometry.computeVertexNormals();
+
+        const texUrl = `/analysis/${stem}/_scene/frames/${padded}.jpg`;
+        const texture = await new Promise<THREE.Texture>((resolve) => {
+          new THREE.TextureLoader().load(texUrl, (tex) => {
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.minFilter = THREE.LinearMipmapLinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            resolve(tex);
+          });
+        });
+
+        const material = new THREE.MeshBasicMaterial({
+          map: texture,
+          side: THREE.DoubleSide,
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.visible = false;
+
+        scene!.add(mesh);
+        meshCache.set(depthIdx, { object: mesh, frameIdx: depthIdx, isPointCloud: false });
+      }
+
+      showOnlyMesh(depthIdx);
+      if (needsFit) {
+        needsFit = false;
+        fitCameraToScene();
+      }
+    } finally {
+      loadingFrames.delete(depthIdx);
+    }
+  }
+
+  function showOnlyMesh(depthIdx: number) {
+    for (const [idx, cached] of meshCache) {
+      cached.object.visible = idx === depthIdx;
+    }
+    currentShownFrame = depthIdx;
+  }
+
+
+
+  function buildCameraPath(cameras: CamerasJson) {
+    if (!scene) return;
+    disposeCameraPath();
+
+    const registeredFrames = cameras.frames
+      .filter((f) => f.registered && f.R && f.t)
+      .sort((a, b) => a.idx - b.idx);
+
+    if (registeredFrames.length < 2) return;
+
+    const points: THREE.Vector3[] = [];
+    cameraPathFrameIndices = new Map();
+    cameraWorldPositions = [];
+
+    // Frustum geometry: 4 corner rays in camera space at unit depth,
+    // scaled by frustumDepth to set the visible size
+    const K = cameras.K;
+    const fx = K[0][0], fy = K[1][1], cxK = K[0][2], cyK = K[1][2];
+    const w = cameras.width, h = cameras.height;
+    // Four image corners unprojected to camera space at z=1
+    const corners = [
+      [(0 - cxK) / fx, (0 - cyK) / fy, 1],       // top-left
+      [(w - cxK) / fx, (0 - cyK) / fy, 1],       // top-right
+      [(w - cxK) / fx, (h - cyK) / fy, 1],       // bottom-right
+      [(0 - cxK) / fx, (h - cyK) / fy, 1],       // bottom-left
+    ];
+
+    // We'll set frustum depth after computing all camera positions
+    // to scale it relative to the path extent
+    const allPositions: THREE.Vector3[] = [];
+
+    for (const f of registeredFrames) {
+      const R = f.R!;
+      const t = f.t!;
+      // Camera center in COLMAP world: c = -Rᵀ t, then flip Y/Z for Three.js
+      const cx = -(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]);
+      const cy = -(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]);
+      const cz = -(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]);
+      const pos = new THREE.Vector3(cx, -cy, -cz);
+      cameraPathFrameIndices.set(f.idx, points.length);
+      cameraWorldPositions.push(pos);
+      allPositions.push(pos);
+      points.push(pos);
+    }
+
+    // Compute frustum depth as a fraction of the path extent
+    const pathBox = new THREE.Box3().setFromPoints(allPositions);
+    const pathSize = pathBox.getSize(new THREE.Vector3());
+    const frustumDepth = Math.max(pathSize.x, pathSize.y, pathSize.z) * 0.04;
+
+    // Build frustums
+    const frustumMat = new THREE.LineBasicMaterial({ color: 0x4488cc, opacity: 0.6, transparent: true });
+    const fwdMat = new THREE.LineBasicMaterial({ color: 0x4444ff }); // blue = forward
+    const upMat = new THREE.LineBasicMaterial({ color: 0x44ff44 });  // green = up
+    for (let fi = 0; fi < registeredFrames.length; fi++) {
+      const f = registeredFrames[fi];
+      const R = f.R!;
+      const t = f.t!;
+
+      // Transform a camera-space point to Three.js coords: Rᵀ(p - t), flip Y/Z
+      const toThreeJS = (px: number, py: number, pz: number): THREE.Vector3 => {
+        const dx = px - t[0], dy = py - t[1], dz = pz - t[2];
+        const wx = R[0][0] * dx + R[1][0] * dy + R[2][0] * dz;
+        const wy = R[0][1] * dx + R[1][1] * dy + R[2][1] * dz;
+        const wz = R[0][2] * dx + R[1][2] * dy + R[2][2] * dz;
+        return new THREE.Vector3(wx, -wy, -wz);
+      };
+
+      const origin = allPositions[fi];
+      const far = corners.map(([cx, cy, cz]) =>
+        toThreeJS(cx * frustumDepth, cy * frustumDepth, cz * frustumDepth)
+      );
+
+      // Camera axes in Three.js coords (at frustumDepth length)
+      const axisLen = frustumDepth * 1.2;
+      const fwd = toThreeJS(0, 0, axisLen);   // +Z camera = forward (look direction)
+      const up = toThreeJS(0, -axisLen, 0);   // -Y camera = up (COLMAP Y is down)
+
+      // 8 line segments for frustum wireframe
+      const verts = new Float32Array(8 * 2 * 3);
+      let vi = 0;
+      const put = (v: THREE.Vector3) => { verts[vi++] = v.x; verts[vi++] = v.y; verts[vi++] = v.z; };
+      for (let c = 0; c < 4; c++) { put(origin); put(far[c]); }
+      for (let c = 0; c < 4; c++) { put(far[c]); put(far[(c + 1) % 4]); }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(verts, 3));
+      const frustum = new THREE.LineSegments(geo, frustumMat);
+      scene.add(frustum);
+      cameraFrustums.push(frustum);
+
+      // Forward axis (blue)
+      const fwdVerts = new Float32Array([origin.x, origin.y, origin.z, fwd.x, fwd.y, fwd.z]);
+      const fwdGeo = new THREE.BufferGeometry();
+      fwdGeo.setAttribute("position", new THREE.BufferAttribute(fwdVerts, 3));
+      const fwdLine = new THREE.LineSegments(fwdGeo, fwdMat);
+      scene.add(fwdLine);
+      cameraFrustums.push(fwdLine);
+
+      // Up axis (green)
+      const upVerts = new Float32Array([origin.x, origin.y, origin.z, up.x, up.y, up.z]);
+      const upGeo = new THREE.BufferGeometry();
+      upGeo.setAttribute("position", new THREE.BufferAttribute(upVerts, 3));
+      const upLine = new THREE.LineSegments(upGeo, upMat);
+      scene.add(upLine);
+      cameraFrustums.push(upLine);
+    }
+
+    // Camera path line
+    const showPath = props.showCameraPath !== false;
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+    const lineMat = new THREE.LineBasicMaterial({ color: 0xe94560, linewidth: 2 });
+    cameraPathLine = new THREE.Line(lineGeo, lineMat);
+    cameraPathLine.visible = showPath;
+    scene.add(cameraPathLine);
+
+    // Current camera marker (small sphere)
+    const markerGeo = new THREE.SphereGeometry(frustumDepth * 0.3, 8, 8);
+    const markerMat = new THREE.MeshBasicMaterial({ color: 0x2ecc71 });
+    cameraMarker = new THREE.Mesh(markerGeo, markerMat);
+    cameraMarker.visible = false; // shown by updateCameraMarker
+    scene.add(cameraMarker);
+
+    // Apply visibility to frustums
+    for (const f of cameraFrustums) f.visible = showPath;
+  }
+
+  function updateCameraMarker(frameIdx: number) {
+    if (!cameraMarker) return;
+    // Find nearest registered frame in the path
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (const [fIdx, pIdx] of cameraPathFrameIndices) {
+      const d = Math.abs(fIdx - frameIdx);
+      if (d < bestDist) { bestDist = d; bestIdx = pIdx; }
+    }
+    if (bestIdx >= 0 && bestIdx < cameraWorldPositions.length) {
+      cameraMarker.position.copy(cameraWorldPositions[bestIdx]);
+      cameraMarker.visible = props.showCameraPath !== false;
+    }
+  }
+
+  /** Set the Three.js camera to match the current COLMAP camera pose */
+  function snapToColmapCamera() {
+    if (!camera || !controls || !props.cameras) return;
+    const depthIdx = nearestDepthFrame(props.currentFrame);
+    if (depthIdx == null) return;
+    const camFrame = findCameraFrame(depthIdx);
+    if (!camFrame || !camFrame.R || !camFrame.t) return;
+
+    const R = camFrame.R;
+    const t = camFrame.t;
+
+    // Camera center in COLMAP world space: c = -Rᵀ t
+    const cx = -(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]);
+    const cy = -(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]);
+    const cz = -(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]);
+
+    // Camera look direction in COLMAP world space: Rᵀ @ [0,0,1] (camera +Z axis)
+    const lookX = R[2][0]; // Rᵀ column 2 = R row 2
+    const lookY = R[2][1];
+    const lookZ = R[2][2];
+
+    // Set FOV from COLMAP intrinsics: vfov = 2 * atan(h / (2*fy))
+    const fy = props.cameras.K[1][1];
+    const imgH = props.cameras.height;
+    const vfovDeg = 2 * Math.atan(imgH / (2 * fy)) * (180 / Math.PI);
+    camera.fov = vfovDeg;
+    camera.updateProjectionMatrix();
+
+    // Flip Y/Z to convert COLMAP world → Three.js coords
+    const posTJS = new THREE.Vector3(cx, -cy, -cz);
+    const lookTJS = new THREE.Vector3(lookX, -lookY, -lookZ).normalize();
+
+    camera.position.copy(posTJS);
+    controls.target.copy(posTJS.clone().add(lookTJS.multiplyScalar(2)));
+    controls.update();
+
+    // Adjust near plane to the closest vertex of the currently-shown mesh
+    // (measured along the view axis) so nothing snapped-in-front clips.
+    const cached = meshCache.get(depthIdx);
+    const posAttr = cached?.object.geometry.getAttribute("position");
+    if (posAttr) {
+      const forward = controls.target.clone().sub(camera.position).normalize();
+      const cp = camera.position;
+      const arr = posAttr.array as ArrayLike<number>;
+      let minDist = Infinity;
+      for (let i = 0; i < arr.length; i += 3) {
+        const dx = arr[i] - cp.x, dy = arr[i + 1] - cp.y, dz = arr[i + 2] - cp.z;
+        const d = dx * forward.x + dy * forward.y + dz * forward.z;
+        if (d > 0 && d < minDist) minDist = d;
+      }
+      if (Number.isFinite(minDist)) {
+        camera.near = Math.max(minDist * 0.5, 1e-4);
+        camera.updateProjectionMatrix();
+      }
+    }
+  }
+
+  function disposeCameraPath() {
+    if (cameraPathLine) {
+      cameraPathLine.geometry.dispose();
+      (cameraPathLine.material as THREE.LineBasicMaterial).dispose();
+      scene?.remove(cameraPathLine);
+      cameraPathLine = null;
+    }
+    if (cameraMarker) {
+      cameraMarker.geometry.dispose();
+      (cameraMarker.material as THREE.MeshBasicMaterial).dispose();
+      scene?.remove(cameraMarker);
+      cameraMarker = null;
+    }
+    // Collect unique materials before disposing
+    const mats = new Set<THREE.Material>();
+    for (const f of cameraFrustums) {
+      f.geometry.dispose();
+      const m = f.material;
+      if (m instanceof THREE.Material) mats.add(m);
+      scene?.remove(f);
+    }
+    for (const m of mats) m.dispose();
+    cameraFrustums = [];
+    cameraPathFrameIndices = new Map();
+    cameraWorldPositions = [];
+  }
+
+  // 3D bounding box visualization
+  let boxerGroup: THREE.Group | null = null;
+  // Per-frame groups so we can show/hide by frame
+  let boxerFrameGroups: Map<number, THREE.Group> = new Map();
+  let currentBoxerFrame: number | null = null;
+
+  function makeTextSprite(text: string, color: string): THREE.Sprite {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d")!;
+    const fontSize = 48;
+    ctx.font = `bold ${fontSize}px monospace`;
+    const metrics = ctx.measureText(text);
+    const pad = 8;
+    canvas.width = Math.ceil(metrics.width) + pad * 2;
+    canvas.height = fontSize + pad * 2;
+    // Re-set font after resize
+    ctx.font = `bold ${fontSize}px monospace`;
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = color;
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, pad, canvas.height / 2);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter;
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false });
+    const sprite = new THREE.Sprite(mat);
+    // Scale so the label is readable but not huge
+    sprite.scale.set(canvas.width / canvas.height * 0.0375, 0.0375, 1);
+    return sprite;
+  }
+
+  function buildBoxWireframe(box: BoxerBox, parent: THREE.Object3D, mat: THREE.LineBasicMaterial, showDims = false) {
+    // box.corners is 8 corners in COLMAP world coords
+    // Convert to Three.js: (x, -y, -z)
+    const c = box.corners.map(
+      (p) => new THREE.Vector3(p[0], -p[1], -p[2])
+    );
+
+    // 12 edges of a box
+    const edgeIndices = [
+      0,1, 1,2, 2,3, 3,0,
+      4,5, 5,6, 6,7, 7,4,
+      0,4, 1,5, 2,6, 3,7,
+    ];
+
+    const verts = new Float32Array(edgeIndices.length * 3);
+    for (let i = 0; i < edgeIndices.length; i++) {
+      const p = c[edgeIndices[i]];
+      verts[i * 3] = p.x;
+      verts[i * 3 + 1] = p.y;
+      verts[i * 3 + 2] = p.z;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(verts, 3));
+    const lines = new THREE.LineSegments(geo, mat);
+    parent.add(lines);
+
+    // Dimension labels along one edge per axis
+    if (showDims) {
+      const color = "#" + mat.color.getHexString();
+      // Three unique edges from corner 0: 0→1, 0→3, 0→4
+      const dimEdges: [number, number][] = [[0, 1], [0, 3], [0, 4]];
+      for (const [a, b] of dimEdges) {
+        const len = c[a].distanceTo(c[b]);
+        const label = `${(len * 100).toFixed(1)}cm`;
+        const sprite = makeTextSprite(label, color);
+        const mid = c[a].clone().add(c[b]).multiplyScalar(0.5);
+        sprite.position.copy(mid);
+        // Scale label size relative to box extent
+        const maxDim = Math.max(c[0].distanceTo(c[1]), c[0].distanceTo(c[3]), c[0].distanceTo(c[4]));
+        const s = maxDim * 0.0375;
+        sprite.scale.set(sprite.scale.x / 0.0375 * s, s, 1);
+        parent.add(sprite);
+      }
+    }
+  }
+
+  function buildBoxerBoxes(result: BoxerResult) {
+    if (!scene) return;
+    disposeBoxerBoxes();
+
+    boxerGroup = new THREE.Group();
+    scene.add(boxerGroup);
+
+    const boxMat = new THREE.LineBasicMaterial({ color: 0xff8800, linewidth: 2 });
+    const fusedMat = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 2 });
+
+    const hasFused = !!(result.fused_boxes && result.fused_boxes.length > 0);
+
+    // If fused boxes exist, show them as always-visible static boxes with dimensions
+    if (hasFused) {
+      for (const box of result.fused_boxes!) {
+        buildBoxWireframe(box, boxerGroup, fusedMat, true);
+      }
+    }
+
+    // Also build per-frame boxes (shown per-frame)
+    const perFrameMat = hasFused ?
+      new THREE.LineBasicMaterial({ color: 0xff8800, opacity: 0.6, transparent: true }) : boxMat;
+
+    for (const frame of result.frames) {
+      if (frame.boxes.length === 0) continue;
+      const frameGroup = new THREE.Group();
+      frameGroup.visible = false;
+      boxerGroup.add(frameGroup);
+      boxerFrameGroups.set(frame.frame, frameGroup);
+
+      for (const box of frame.boxes) {
+        buildBoxWireframe(box, frameGroup, perFrameMat, !hasFused);
+      }
+    }
+
+    // Show the per-frame box for the current frame immediately
+    currentBoxerFrame = null;
+    updateBoxerFrame(props.currentFrame);
+  }
+
+  function updateBoxerFrame(frameIdx: number) {
+    if (!boxerGroup || boxerFrameGroups.size === 0) return;
+
+    // Find nearest boxer frame
+    let bestFrame = -1;
+    let bestDist = Infinity;
+    for (const fIdx of boxerFrameGroups.keys()) {
+      const d = Math.abs(fIdx - frameIdx);
+      if (d < bestDist) { bestDist = d; bestFrame = fIdx; }
+    }
+
+    if (bestFrame === currentBoxerFrame) return;
+    currentBoxerFrame = bestFrame;
+
+    // Show nearest, hide others
+    for (const [fIdx, group] of boxerFrameGroups) {
+      group.visible = fIdx === bestFrame;
+    }
+  }
+
+  function disposeBoxerBoxes() {
+    if (boxerGroup && scene) {
+      boxerGroup.traverse((obj) => {
+        if (obj instanceof THREE.LineSegments) {
+          obj.geometry.dispose();
+          if (obj.material instanceof THREE.Material) obj.material.dispose();
+        } else if (obj instanceof THREE.Sprite) {
+          const mat = obj.material as THREE.SpriteMaterial;
+          mat.map?.dispose();
+          mat.dispose();
+        }
+      });
+      scene.remove(boxerGroup);
+    }
+    boxerGroup = null;
+    boxerFrameGroups = new Map();
+    currentBoxerFrame = null;
+  }
+
+  // --- WildDet3D boxes (cyan) ---
+  let wilddetGroup: THREE.Group | null = null;
+  let wilddetFrameGroups: Map<number, THREE.Group> = new Map();
+  let currentWilddetFrame: number | null = null;
+
+  function buildWilddetBoxes(result: BoxerResult) {
+    if (!scene) return;
+    disposeWilddetBoxes();
+
+    wilddetGroup = new THREE.Group();
+    scene.add(wilddetGroup);
+
+    const boxMat = new THREE.LineBasicMaterial({ color: 0x00ccff, linewidth: 2 });
+
+    for (const frame of result.frames) {
+      if (frame.boxes.length === 0) continue;
+      const frameGroup = new THREE.Group();
+      frameGroup.visible = false;
+      wilddetGroup.add(frameGroup);
+      wilddetFrameGroups.set(frame.frame, frameGroup);
+
+      for (const box of frame.boxes) {
+        buildBoxWireframe(box, frameGroup, boxMat, true);
+      }
+    }
+
+    currentWilddetFrame = null;
+    updateWilddetFrame(props.currentFrame);
+  }
+
+  function updateWilddetFrame(frameIdx: number) {
+    if (!wilddetGroup || wilddetFrameGroups.size === 0) return;
+
+    let bestFrame = -1;
+    let bestDist = Infinity;
+    for (const fIdx of wilddetFrameGroups.keys()) {
+      const d = Math.abs(fIdx - frameIdx);
+      if (d < bestDist) { bestDist = d; bestFrame = fIdx; }
+    }
+
+    if (bestFrame === currentWilddetFrame) return;
+    currentWilddetFrame = bestFrame;
+
+    for (const [fIdx, group] of wilddetFrameGroups) {
+      group.visible = fIdx === bestFrame;
+    }
+  }
+
+  function disposeWilddetBoxes() {
+    if (wilddetGroup && scene) {
+      wilddetGroup.traverse((obj) => {
+        if (obj instanceof THREE.LineSegments) {
+          obj.geometry.dispose();
+          if (obj.material instanceof THREE.Material) obj.material.dispose();
+        } else if (obj instanceof THREE.Sprite) {
+          const mat = obj.material as THREE.SpriteMaterial;
+          mat.map?.dispose();
+          mat.dispose();
+        }
+      });
+      scene.remove(wilddetGroup);
+    }
+    wilddetGroup = null;
+    wilddetFrameGroups = new Map();
+    currentWilddetFrame = null;
+  }
+
+  function disposeMeshes() {
+    for (const [, cached] of meshCache) {
+      cached.object.geometry.dispose();
+      if (cached.isPointCloud) {
+        (cached.object.material as THREE.PointsMaterial).dispose();
+      } else {
+        const mat = cached.object.material as THREE.MeshBasicMaterial;
+        mat.map?.dispose();
+        mat.dispose();
+      }
+      scene?.remove(cached.object);
+    }
+    meshCache.clear();
+    currentShownFrame = null;
+    loadingFrames.clear();
+  }
+
+  function disposeScenePointmap() {
+    if (scenePointmapObj && scene) {
+      scenePointmapObj.geometry.dispose();
+      (scenePointmapObj.material as THREE.PointsMaterial).dispose();
+      scene.remove(scenePointmapObj);
+    }
+    scenePointmapObj = null;
+  }
+
+  async function loadScenePointmap() {
+    if (!scene || !props.depthStem || scenePointmapLoading) return;
+    const plugin = getScenePluginOrDefault(props.sceneSource);
+    if (!plugin.features?.scenePointmap) return;
+
+    scenePointmapLoading = true;
+    try {
+      const url = `/analysis/${props.depthStem}/_scene/${plugin.camerasDir}/scene_pointmap.npz`;
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      const buf = await resp.arrayBuffer();
+      const arrays = await parseNpz(buf);
+      const pts3dArr = arrays["pts3d"];
+      const rgbArr = arrays["rgb"];
+      const confArr = arrays["conf"];
+      if (!pts3dArr || !rgbArr || !confArr) return;
+
+      const result = buildScenePointCloud(
+        new Float32Array(pts3dArr.data),
+        new Uint8Array(rgbArr.data),
+        new Float32Array(confArr.data),
+      );
+
+      if (result.pointCount === 0) return;
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(result.positions, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(result.colors, 3));
+      geometry.computeBoundingBox();
+
+      const bbox = geometry.boundingBox!;
+      const extent = bbox.getSize(new THREE.Vector3());
+      const pointSize = Math.max(extent.x, extent.y, extent.z) * 0.002;
+
+      const material = new THREE.PointsMaterial({
+        size: pointSize,
+        vertexColors: true,
+        sizeAttenuation: true,
+      });
+      scenePointmapObj = new THREE.Points(geometry, material);
+      scene!.add(scenePointmapObj);
+
+      fitCameraToScene();
+    } finally {
+      scenePointmapLoading = false;
+    }
+  }
+
+  function disposeAll() {
+    disposeBoxerBoxes();
+    disposeWilddetBoxes();
+    disposeMeshes();
+    disposeScenePointmap();
+    disposeCameraPath();
+  }
+
+  function resetCamera() {
+    if (!camera || !controls) return;
+    // Position camera looking at origin, offset along Z
+    camera.position.set(0, 0, 5);
+    controls.target.set(0, 0, 0);
+    controls.update();
+  }
+
+  function fitCameraToScene() {
+    if (!camera || !controls) return;
+    // Fit to camera path positions (not the full mesh extent)
+    if (cameraWorldPositions.length === 0) return;
+    const box = new THREE.Box3();
+    for (const p of cameraWorldPositions) {
+      box.expandByPoint(p);
+    }
+    if (box.isEmpty()) return;
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const dist = maxDim * 2;
+    camera.position.copy(center).add(new THREE.Vector3(0, 0, dist));
+    camera.near = dist * 0.0005;
+    camera.far = dist * 200;
+    camera.updateProjectionMatrix();
+    controls.target.copy(center);
+    controls.update();
+  }
+
+  onMount(() => {
+    // Create renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setClearColor(0x111111);
+    containerEl.appendChild(renderer.domElement);
+
+    // Scene
+    scene = new THREE.Scene();
+
+    // Camera
+    camera = new THREE.PerspectiveCamera(60, 1, 0.005, 1000);
+    camera.position.set(0, 0, 5);
+
+    // Controls
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.1;
+
+    // Restore saved 3D view
+    try {
+      const saved = localStorage.getItem("segviewer:3dview");
+      if (saved) {
+        const v = JSON.parse(saved);
+        camera.position.set(v.cx, v.cy, v.cz);
+        controls.target.set(v.tx, v.ty, v.tz);
+        if (v.fov) camera.fov = v.fov;
+        if (v.near) camera.near = v.near;
+        if (v.far) camera.far = v.far;
+        camera.updateProjectionMatrix();
+        controls.update();
+      }
+    } catch {}
+
+    // Axes helper
+    scene.add(new THREE.AxesHelper(1));
+
+    // Size to container
+    const resize = () => {
+      if (!renderer || !camera) return;
+      const w = containerEl.clientWidth;
+      const h = containerEl.clientHeight;
+      if (w === 0 || h === 0) return;
+      renderer.setSize(w, h);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    };
+    resizeObs = new ResizeObserver(resize);
+    resizeObs.observe(containerEl);
+    resize();
+
+    // Track mouse position in NDC for raycasting
+    const mouse = new THREE.Vector2();
+    const raycaster = new THREE.Raycaster();
+    const handleMouseMove = (e: MouseEvent) => {
+      const rect = containerEl.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    };
+    containerEl.addEventListener("mousemove", handleMouseMove);
+
+    // Keyboard shortcuts
+    const handleKey = (e: KeyboardEvent) => {
+      if (!props.visible) return;
+      if (e.key === "f") {
+        snapToColmapCamera();
+      } else if (e.key === "c" && camera && controls && scene) {
+        raycaster.setFromCamera(mouse, camera);
+        // Collect visible meshes for raycasting
+        const targets: THREE.Object3D[] = [];
+        for (const [, cached] of meshCache) {
+          if (cached.object.visible && !cached.isPointCloud) targets.push(cached.object);
+        }
+        const hits = raycaster.intersectObjects(targets, false);
+        if (hits.length > 0) {
+          controls.target.copy(hits[0].point);
+          controls.update();
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKey);
+
+    // Render loop — save 3D view to localStorage every ~2s
+    let lastSaveTime = 0;
+    const animate = () => {
+      animId = requestAnimationFrame(animate);
+      controls?.update();
+      if (renderer && scene && camera) {
+        renderer.render(scene, camera);
+      }
+      const now = performance.now();
+      if (now - lastSaveTime > 2000 && camera && controls) {
+        lastSaveTime = now;
+        const p = camera.position;
+        const t = controls.target;
+        localStorage.setItem("segviewer:3dview", JSON.stringify({
+          cx: p.x, cy: p.y, cz: p.z,
+          tx: t.x, ty: t.y, tz: t.z,
+          fov: camera.fov, near: camera.near, far: camera.far,
+        }));
+      }
+    };
+    animate();
+
+    onCleanup(() => {
+      containerEl.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("keydown", handleKey);
+      if (animId !== null) cancelAnimationFrame(animId);
+      resizeObs?.disconnect();
+      disposeAll();
+      controls?.dispose();
+      renderer?.dispose();
+      if (renderer?.domElement.parentNode) {
+        renderer.domElement.parentNode.removeChild(renderer.domElement);
+      }
+    });
+
+    // Expose actions to parent
+    props.onReady?.({
+      snapCamera: () => snapToColmapCamera(),
+      fitAll: () => fitCameraToScene(),
+    });
+  });
+
+  // Show/hide camera path
+  createEffect(() => {
+    const show = props.showCameraPath !== false;
+    if (cameraPathLine) cameraPathLine.visible = show;
+    if (cameraMarker) cameraMarker.visible = show;
+    for (const f of cameraFrustums) f.visible = show;
+  });
+
+  // Build camera path when cameras data or data version changes
+  createEffect(on(
+    () => [props.cameras, props.dataVersion] as const,
+    ([cameras]) => {
+      if (cameras && scene) {
+        buildCameraPath(cameras);
+      }
+    },
+  ));
+
+  // React to frame changes — update depth mesh and camera marker
+  createEffect(on(
+    () => [props.currentFrame, props.visible, props.depthFrames, props.cameras, props.usePointmap, props.scenePointmapMode, props.dataVersion, props.downsample] as const,
+    ([frame, visible, depthFrames, cameras]) => {
+      if (!visible || !cameras) return;
+      updateCameraMarker(frame);
+      // In scene pointmap mode, don't load per-frame meshes
+      if (props.scenePointmapMode) return;
+      if (!depthFrames.length) return;
+      const depthIdx = nearestDepthFrame(frame);
+      if (depthIdx == null || depthIdx === currentShownFrame) return;
+      loadAndShowFrame(depthIdx);
+    },
+  ));
+
+  // Build 3D boxes when boxer result changes
+  createEffect(on(
+    () => props.boxerResult,
+    (result) => {
+      if (result && scene) {
+        buildBoxerBoxes(result);
+      } else {
+        disposeBoxerBoxes();
+      }
+    },
+  ));
+
+  // Update visible boxer frame when current frame changes
+  createEffect(on(
+    () => [props.currentFrame, props.visible, props.boxerResult] as const,
+    ([frame, visible]) => {
+      if (!visible) return;
+      updateBoxerFrame(frame);
+    },
+  ));
+
+  // Build WildDet3D boxes when result changes
+  createEffect(on(
+    () => props.wilddetResult,
+    (result) => {
+      if (result && scene) {
+        buildWilddetBoxes(result);
+      } else {
+        disposeWilddetBoxes();
+      }
+    },
+  ));
+
+  // Update visible WildDet3D frame when current frame changes
+  createEffect(on(
+    () => [props.currentFrame, props.visible, props.wilddetResult] as const,
+    ([frame, visible]) => {
+      if (!visible) return;
+      updateWilddetFrame(frame);
+    },
+  ));
+
+  // React to video, source, pointmap, or data version change — dispose old meshes
+  let lastVideo: string | null = null;
+  let lastSource: string | undefined = undefined;
+  let lastPointmap: boolean | undefined = undefined;
+  let lastDataVersion: number | undefined = undefined;
+  let lastDownsample: number | undefined = undefined;
+  // Only auto-fit camera when loading a genuinely new video (not on reload/source switch)
+  let needsFit = false;
+  createEffect(on(
+    () => [props.videoName, props.sceneSource, props.usePointmap, props.dataVersion, props.downsample] as const,
+    ([videoName, source, usePointmap, dataVersion, downsample]) => {
+      const videoChanged = videoName !== lastVideo;
+      const sourceChanged = source !== lastSource;
+      const pointmapChanged = usePointmap !== lastPointmap;
+      const dataVersionChanged = dataVersion !== lastDataVersion;
+      const downsampleChanged = lastDownsample !== undefined && downsample !== lastDownsample;
+      const isInitial = lastVideo === null;
+      lastVideo = videoName;
+      lastSource = source;
+      lastPointmap = usePointmap;
+      lastDataVersion = dataVersion;
+      lastDownsample = downsample;
+
+      if (videoChanged) {
+        disposeAll();
+        if (!isInitial) {
+          needsFit = true;
+        } else if (!localStorage.getItem("segviewer:3dview")) {
+          needsFit = true;
+        }
+      } else if (sourceChanged || dataVersionChanged) {
+        // Source switch or data refresh (align, re-run) — dispose meshes only, camera path rebuilds via cameras effect
+        disposeMeshes();
+        disposeScenePointmap();
+      } else if (pointmapChanged || downsampleChanged) {
+        disposeMeshes();
+      }
+    },
+  ));
+
+  // Scene pointmap mode — load/dispose the global reconstruction
+  let lastSceneMode: boolean | undefined = undefined;
+  let lastSceneDataVersion: number | undefined = undefined;
+  createEffect(on(
+    () => [props.scenePointmapMode, props.visible, props.depthStem, props.sceneSource, props.dataVersion] as const,
+    ([sceneMode, visible, , , dataVersion]) => {
+      const changed = sceneMode !== lastSceneMode;
+      const dataChanged = dataVersion !== lastSceneDataVersion;
+      lastSceneMode = sceneMode;
+      lastSceneDataVersion = dataVersion;
+
+      if (sceneMode && visible) {
+        // Entering scene pointmap mode: hide per-frame meshes, boxes, cameras
+        for (const [, cached] of meshCache) cached.object.visible = false;
+        if (boxerGroup) boxerGroup.visible = false;
+        if (wilddetGroup) wilddetGroup.visible = false;
+        if (cameraPathLine) cameraPathLine.visible = false;
+        if (cameraMarker) cameraMarker.visible = false;
+        for (const f of cameraFrustums) f.visible = false;
+        // Re-fetch if data version changed (e.g. after align)
+        if (dataChanged && scenePointmapObj) {
+          disposeScenePointmap();
+        }
+        if (!scenePointmapObj) loadScenePointmap();
+      } else if (changed && !sceneMode) {
+        // Leaving scene pointmap mode: dispose global cloud, restore everything
+        disposeScenePointmap();
+        if (currentShownFrame != null) showOnlyMesh(currentShownFrame);
+        if (boxerGroup) {
+          boxerGroup.visible = true;
+          currentBoxerFrame = null;  // force re-evaluation
+          updateBoxerFrame(props.currentFrame);
+        }
+        if (wilddetGroup) {
+          wilddetGroup.visible = true;
+          currentWilddetFrame = null;  // force re-evaluation
+          updateWilddetFrame(props.currentFrame);
+        }
+        const showPath = props.showCameraPath !== false;
+        if (cameraPathLine) cameraPathLine.visible = showPath;
+        if (cameraMarker) cameraMarker.visible = showPath;
+        for (const f of cameraFrustums) f.visible = showPath;
+      }
+    },
+  ));
+
+  return (
+    <div
+      ref={containerEl!}
+      style={{
+        position: "absolute",
+        inset: "0",
+        display: props.visible ? "block" : "none",
+      }}
+    />
+  );
+}
