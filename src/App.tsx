@@ -8,6 +8,11 @@ import {
   DEFAULT_SCENE_PLUGIN_ID,
   getScenePluginOrDefault,
 } from "./scenePlugins";
+import {
+  BOX_SOLVER_PLUGINS,
+  BOX_SOLVER_PLUGINS_BY_ID,
+  DEFAULT_BOX_SOLVER_ID,
+} from "./boxSolverPlugins";
 
 /** Viridis colormap (256 entries) — [r,g,b] each 0–255 */
 const VIRIDIS: [number, number, number][] = [];
@@ -94,13 +99,44 @@ export default function App() {
   const [settingFloor, setSettingFloor] = createSignal(false);
   const [floorPoints, setFloorPoints] = createSignal<{ x: number; y: number; frame: number }[]>([]);
   const [aligning, setAligning] = createSignal(false);
-  const [boxerResult, setBoxerResult] = createSignal<BoxerResult | null>(null);
-  const [boxerRunning, setBoxerRunning] = createSignal(false);
-  const [boxerFuse, setBoxerFuse] = createSignal(true);
-  const [wilddetResult, setWilddetResult] = createSignal<BoxerResult | null>(null);
-  const [wilddetRunning, setWilddetRunning] = createSignal(false);
-  const [wilddetUseIntrinsics, setWilddetUseIntrinsics] = createSignal(false);
-  const [wilddetUseDepth, setWilddetUseDepth] = createSignal(false);
+  // Active 3D-box solver: which method produced the result currently shown,
+  // and which method will run when the user clicks "Compute Boxes".
+  const savedBoxSolverId = localStorage.getItem("segviewer:boxSolver");
+  const [boxSolverId, setBoxSolverId] = createSignal<string>(
+    savedBoxSolverId && BOX_SOLVER_PLUGINS_BY_ID[savedBoxSolverId]
+      ? savedBoxSolverId
+      : DEFAULT_BOX_SOLVER_ID,
+  );
+  createEffect(() => localStorage.setItem("segviewer:boxSolver", boxSolverId()));
+
+  const [boxResult, setBoxResult] = createSignal<BoxerResult | null>(null);
+  const [boxRunning, setBoxRunning] = createSignal(false);
+  // Per-solver option toggles, keyed by solver id then option key. Initialized
+  // from each plugin's defaults; persisted to localStorage so re-runs keep
+  // the user's last choice.
+  const savedBoxSolverOptionsRaw = localStorage.getItem("segviewer:boxSolverOptions");
+  const initialBoxSolverOptions: Record<string, Record<string, boolean>> = (() => {
+    const base: Record<string, Record<string, boolean>> = {};
+    for (const p of BOX_SOLVER_PLUGINS) {
+      base[p.id] = {};
+      for (const opt of p.options) base[p.id][opt.key] = opt.defaultValue;
+    }
+    if (savedBoxSolverOptionsRaw) {
+      try {
+        const saved = JSON.parse(savedBoxSolverOptionsRaw) as Record<string, Record<string, boolean>>;
+        for (const p of BOX_SOLVER_PLUGINS) {
+          for (const opt of p.options) {
+            const v = saved?.[p.id]?.[opt.key];
+            if (typeof v === "boolean") base[p.id][opt.key] = v;
+          }
+        }
+      } catch {}
+    }
+    return base;
+  })();
+  const [boxSolverOptions, setBoxSolverOptions] =
+    createSignal<Record<string, Record<string, boolean>>>(initialBoxSolverOptions);
+  createEffect(() => localStorage.setItem("segviewer:boxSolverOptions", JSON.stringify(boxSolverOptions())));
   const [reconstructRunning, setReconstructRunning] = createSignal(false);
   const [reconstructMesh, setReconstructMesh] = createSignal<string | null>(null);
   // Available .glb meshes for the current analysis (filenames like "000063.glb")
@@ -338,8 +374,7 @@ export default function App() {
       setCurrentAnalysis(name);
       localStorage.setItem("segviewer:analysis", name);
       setTrackData(null);
-      setBoxerResult(null);
-      setWilddetResult(null);
+      setBoxResult(null);
       // Try to load an existing track result for this analysis
       try {
         const tr = await fetch(`/api/track-result?video=${encodeURIComponent(video)}&name=${encodeURIComponent(name)}`);
@@ -348,20 +383,9 @@ export default function App() {
           setTrackData({ imageWidth: td.image_width, imageHeight: td.image_height, frames: td.frames });
         }
       } catch {}
-      // Try to load existing boxer result
-      try {
-        const br = await fetch(`/api/boxer-result?video=${encodeURIComponent(video)}&name=${encodeURIComponent(name)}`);
-        if (br.ok) {
-          setBoxerResult(await br.json());
-        }
-      } catch {}
-      // Try to load existing wilddet3d result
-      try {
-        const wd = await fetch(`/api/wilddet3d-result?video=${encodeURIComponent(video)}&name=${encodeURIComponent(name)}`);
-        if (wd.ok) {
-          setWilddetResult(await wd.json());
-        }
-      } catch {}
+      // Try to load existing 3D-box result for the currently selected solver.
+      // Switching solver later refetches via the solver-change effect.
+      await refreshBoxResult(video, name, boxSolverId());
       setReconstructMesh(null);
       setSelectedMesh(null);
       await refreshReconstructMeshes(video, name);
@@ -377,8 +401,7 @@ export default function App() {
       return;
     }
     setTracking(true);
-    setBoxerResult(null);
-    setWilddetResult(null);
+    setBoxResult(null);
     setStatus(`Tracking through video with SAM2 (this can take a while)...`);
     try {
       const res = await fetch("/api/track", {
@@ -397,105 +420,89 @@ export default function App() {
     }
   }
 
-  async function runBoxer() {
-    const video = videoName();
-    const analysis = currentAnalysis();
-    if (!video || !analysis || !trackData()) {
-      setStatus("Run tracking first before running Boxer");
-      return;
-    }
-    setBoxerRunning(true);
-    setBoxerResult(null);
-    setWilddetResult(null);
-    setStatus("Running Boxer 3D bounding box lifting...");
+  // Fetch /api/box-solver-result for (video, analysis, solverId), drop into
+  // boxResult on success, clear on 404. Used both at analysis-load time and
+  // when the user switches solver in the dropdown.
+  async function refreshBoxResult(video: string, analysis: string, solverId: string) {
     try {
-      const det = detection();
-      const res = await fetch("/api/boxer", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ video, analysis, label: det?.label ?? "object", fuse: boxerFuse(), source: sceneSource() }),
-      });
-      const data = await res.json();
-      if (data.error) { setStatus(`Boxer failed: ${data.error}`); return; }
-      // Poll for result
-      setStatus("Boxer running — waiting for result...");
-      const poll = setInterval(async () => {
-        try {
-          const r = await fetch(`/api/boxer-result?video=${encodeURIComponent(video)}&name=${encodeURIComponent(analysis)}`);
-          if (r.ok) {
-            clearInterval(poll);
-            const result = await r.json();
-            setBoxerResult(result);
-            setBoxerRunning(false);
-            setStatus(`Boxer: ${result.num_frames_with_boxes} frames with 3D boxes`);
-          }
-        } catch {}
-      }, 2000);
-      // Timeout after 10 minutes
-      setTimeout(() => {
-        clearInterval(poll);
-        if (boxerRunning()) {
-          setBoxerRunning(false);
-          setStatus("Boxer timed out");
-        }
-      }, 600000);
-    } catch (err: any) {
-      setStatus(`Boxer error: ${err.message}`);
-      setBoxerRunning(false);
-    }
+      const r = await fetch(
+        `/api/box-solver-result?video=${encodeURIComponent(video)}` +
+        `&name=${encodeURIComponent(analysis)}&solverId=${encodeURIComponent(solverId)}`,
+      );
+      if (r.ok) {
+        setBoxResult(await r.json());
+        return;
+      }
+    } catch {}
+    setBoxResult(null);
   }
 
-  async function runWilddet() {
+  async function runBoxSolver() {
     const video = videoName();
     const analysis = currentAnalysis();
-    if (!video || !analysis || !trackData()) {
-      setStatus("Run tracking first before running WildDet3D");
+    const solverId = boxSolverId();
+    const solver = BOX_SOLVER_PLUGINS_BY_ID[solverId];
+    if (!video || !analysis || !trackData() || !solver) {
+      setStatus("Run tracking first before computing 3D boxes");
       return;
     }
-    setWilddetRunning(true);
-    setBoxerResult(null);
-    setWilddetResult(null);
-    setStatus("Running WildDet3D 3D bounding box lifting...");
+    if (solver.requiresDepth && depthFrames().length === 0) {
+      setStatus(`${solver.label} needs depth maps — run a scene plugin first`);
+      return;
+    }
+    setBoxRunning(true);
+    setBoxResult(null);
+    setStatus(`Running ${solver.label} 3D bounding box lifting...`);
     try {
       const det = detection();
-      const res = await fetch("/api/wilddet3d", {
+      const res = await fetch("/api/box-solver", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          video, analysis,
+          video, analysis, solverId,
           label: det?.label ?? "object",
           source: sceneSource(),
-          useIntrinsics: wilddetUseIntrinsics(),
-          useDepth: wilddetUseDepth(),
+          options: boxSolverOptions()[solverId] ?? {},
         }),
       });
       const data = await res.json();
-      if (data.error) { setStatus(`WildDet3D failed: ${data.error}`); setWilddetRunning(false); return; }
-      // Poll for result
-      setStatus("WildDet3D running — waiting for result...");
+      if (data.error) {
+        setStatus(`${solver.label} failed: ${data.error}`);
+        setBoxRunning(false);
+        return;
+      }
+      setStatus(`${solver.label} running — waiting for result...`);
       const poll = setInterval(async () => {
+        // Bail out if the user switched solvers mid-run; the new solver's
+        // poller will own the running state.
+        if (boxSolverId() !== solverId) {
+          clearInterval(poll);
+          return;
+        }
         try {
-          const r = await fetch(`/api/wilddet3d-result?video=${encodeURIComponent(video)}&name=${encodeURIComponent(analysis)}`);
+          const r = await fetch(
+            `/api/box-solver-result?video=${encodeURIComponent(video)}` +
+            `&name=${encodeURIComponent(analysis)}&solverId=${encodeURIComponent(solverId)}`,
+          );
           if (r.ok) {
             clearInterval(poll);
             const result = await r.json();
-            setWilddetResult(result);
-            setWilddetRunning(false);
-            setStatus(`WildDet3D: ${result.num_frames_with_boxes} frames with 3D boxes`);
+            setBoxResult(result);
+            setBoxRunning(false);
+            setStatus(`${solver.label}: ${result.num_frames_with_boxes} frames with 3D boxes`);
           }
         } catch {}
-      }, 3000);
-      // Timeout after 10 minutes
+      }, 2000);
       setTimeout(() => {
         clearInterval(poll);
-        if (wilddetRunning()) {
-          setWilddetRunning(false);
-          setStatus("WildDet3D timed out");
+        if (boxRunning()) {
+          setBoxRunning(false);
+          setStatus(`${solver.label} timed out`);
         }
       }, 600000);
     } catch (err: any) {
-      setStatus(`WildDet3D error: ${err.message}`);
-      setWilddetRunning(false);
+      setStatus(`${solver.label} error: ${err.message}`);
+      setBoxRunning(false);
     }
   }
 
@@ -609,8 +616,7 @@ export default function App() {
         setDetection(null);
         setCurrentAnalysis(null);
         setTrackData(null);
-        setBoxerResult(null);
-        setWilddetResult(null);
+        setBoxResult(null);
         setReconstructMesh(null);
         setReconstructMeshes([]);
         setSelectedMesh(null);
@@ -646,8 +652,7 @@ export default function App() {
         setDetection(null);
         setSeedPoint(null);
         setTrackData(null);
-        setBoxerResult(null);
-        setWilddetResult(null);
+        setBoxResult(null);
         setReconstructMesh(null);
         setReconstructMeshes([]);
         setSelectedMesh(null);
@@ -671,8 +676,7 @@ export default function App() {
     setDetection(null);
     setCurrentAnalysis(null);
     setTrackData(null);
-    setBoxerResult(null);
-    setWilddetResult(null);
+    setBoxResult(null);
     setReconstructMesh(null);
     setReconstructMeshes([]);
     setSelectedMesh(null);
@@ -855,8 +859,7 @@ export default function App() {
     }
     setAligning(true);
     setSettingFloor(false);
-    setBoxerResult(null);
-    setWilddetResult(null);
+    setBoxResult(null);
     setStatus("Aligning scene to floor plane...");
     try {
       const res = await fetch("/api/scene/align", {
@@ -886,8 +889,7 @@ export default function App() {
     const plugin = SCENE_PLUGINS_BY_ID[pluginId];
     if (!plugin) return;
     setPreparingPluginId(pluginId);
-    setBoxerResult(null);
-    setWilddetResult(null);
+    setBoxResult(null);
     setStatus(`Starting ${plugin.label}...`);
     try {
       const options: Record<string, unknown> = {};
@@ -1424,8 +1426,7 @@ export default function App() {
                 value={sceneSource()}
                 onChange={(e) => {
                   setSceneSource(e.currentTarget.value);
-                  setBoxerResult(null);
-                  setWilddetResult(null);
+                  setBoxResult(null);
                   const v = videoName();
                   if (v) refreshDepthFrames(v);
                 }}
@@ -1647,78 +1648,101 @@ export default function App() {
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
                 Object Placement
               </div>
-              <div style={{ display: "flex", gap: "4px" }}>
-                <button
-                  style={{
-                    ...accentBtnStyle(!!trackData() && depthFrames().length > 0 && !boxerRunning(), !!boxerResult()),
-                    flex: "1",
-                  }}
-                  title={boxerResult()?.num_frames_with_boxes
-                    ? `Boxer produced 3D boxes on ${boxerResult()!.num_frames_with_boxes} frames. Click to re-run.`
-                    : "Lift the tracked 2D mask into a 3D oriented bounding box per frame using the depth maps from the active scene plugin. Requires depth, so run a scene plugin first. Use the Fuse toggle to combine all frames into one stable box."}
-                  onClick={runBoxer}
-                  disabled={!trackData() || depthFrames().length === 0 || boxerRunning()}
-                >
-                  {boxerRunning() ? "Running..." : "Lift to 3D (Boxer)"}
-                </button>
-                <button
-                  style={{
-                    ...btnStyle(true),
-                    background: boxerFuse() ? "#2ecc71" : "#333",
-                    color: boxerFuse() ? "#000" : "#777",
-                    "font-weight": "600",
-                    "font-size": "10px",
-                    padding: "4px 8px",
-                  }}
-                  onClick={() => setBoxerFuse(!boxerFuse())}
-                  title="When enabled, Boxer fuses all frames' masked point clouds into a single shared 3D box (more stable, slower). When off, it fits an independent box per frame (jittery but tracks pose changes)."
-                >
-                  Fuse
-                </button>
-              </div>
-              <div style={{ display: "flex", gap: "4px", "margin-top": "6px" }}>
-                <button
-                  style={{
-                    ...accentBtnStyle(!!trackData() && !wilddetRunning(), !!wilddetResult()),
-                    flex: "1",
-                  }}
-                  title={wilddetResult()?.num_frames_with_boxes
-                    ? `WildDet3D produced 3D boxes on ${wilddetResult()!.num_frames_with_boxes} frames. Click to re-run.`
-                    : "Run WildDet3D — a neural 3D detector — on the tracked frames. Unlike Boxer, it predicts 3D boxes directly from the image (and optionally K and/or depth maps via the K and D toggles) without needing a fully reconstructed scene."}
-                  onClick={runWilddet}
-                  disabled={!trackData() || wilddetRunning()}
-                >
-                  {wilddetRunning() ? "Running..." : "Lift to 3D (WildDet3D)"}
-                </button>
-                <button
-                  style={{
-                    ...btnStyle(true),
-                    background: wilddetUseIntrinsics() ? "#2ecc71" : "#333",
-                    color: wilddetUseIntrinsics() ? "#000" : "#777",
-                    "font-weight": "600",
-                    "font-size": "10px",
-                    padding: "4px 8px",
-                  }}
-                  title="Pass camera intrinsics (K) from the active scene plugin to WildDet3D as a prior. Improves 3D box scale/orientation when poses are well-calibrated; turn off to let the model estimate K itself."
-                  onClick={() => setWilddetUseIntrinsics(!wilddetUseIntrinsics())}
-                >
-                  K
-                </button>
-                <button
-                  style={{
-                    ...btnStyle(true),
-                    background: wilddetUseDepth() ? "#2ecc71" : "#333",
-                    color: wilddetUseDepth() ? "#000" : "#777",
-                    "font-weight": "600",
-                    "font-size": "10px",
-                    padding: "4px 8px",
-                  }}
-                  title="Pass per-frame depth maps from the active scene plugin to WildDet3D as a prior. Anchors box depth more reliably; turn off to let the model predict depth from the RGB alone."
-                  onClick={() => setWilddetUseDepth(!wilddetUseDepth())}
-                >
-                  D
-                </button>
-              </div>
+              <select
+                value={boxSolverId()}
+                onChange={(e) => {
+                  const id = e.currentTarget.value;
+                  setBoxSolverId(id);
+                  // Refetch result for this analysis under the newly selected solver.
+                  const v = videoName();
+                  const a = currentAnalysis();
+                  if (v && a) refreshBoxResult(v, a, id);
+                  else setBoxResult(null);
+                }}
+                title="Pick which 3D-box solver runs when you click Compute Boxes. Boxer fits an oriented box from depth + masked point clouds (needs depth, supports per-frame or fused). WildDet3D is a neural detector that predicts 3D boxes directly from the image (no depth required, optionally takes K/depth as priors)."
+                style={{
+                  width: "100%",
+                  padding: "6px 8px",
+                  "margin-bottom": "6px",
+                  background: "#0a0e1a",
+                  border: "1px solid #0f3460",
+                  color: "#e0e0e0",
+                  "border-radius": "3px",
+                  "font-size": "12px",
+                  "font-family": "inherit",
+                  cursor: "pointer",
+                }}
+              >
+                <For each={BOX_SOLVER_PLUGINS}>
+                  {(s) => <option value={s.id}>{s.label}</option>}
+                </For>
+              </select>
+              <Show when={BOX_SOLVER_PLUGINS_BY_ID[boxSolverId()]?.options.length}>
+                <div style={{ display: "flex", "flex-wrap": "wrap", gap: "4px 12px", "margin-bottom": "6px" }}>
+                  <For each={BOX_SOLVER_PLUGINS_BY_ID[boxSolverId()]?.options ?? []}>
+                    {(opt) => {
+                      const value = () => boxSolverOptions()[boxSolverId()]?.[opt.key] ?? false;
+                      return (
+                        <label
+                          style={{
+                            display: "flex",
+                            "align-items": "center",
+                            gap: "6px",
+                            "font-size": "12px",
+                            color: "#aaa",
+                            cursor: "pointer",
+                          }}
+                          title={opt.description}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={value()}
+                            onChange={(e) => {
+                              const id = boxSolverId();
+                              const checked = e.currentTarget.checked;
+                              setBoxSolverOptions((prev) => ({
+                                ...prev,
+                                [id]: { ...(prev[id] ?? {}), [opt.key]: checked },
+                              }));
+                            }}
+                            style={{ cursor: "pointer" }}
+                          />
+                          {opt.label}
+                        </label>
+                      );
+                    }}
+                  </For>
+                </div>
+              </Show>
+              {(() => {
+                const solver = () => BOX_SOLVER_PLUGINS_BY_ID[boxSolverId()];
+                const ready = () => !!boxResult();
+                const enabled = () => {
+                  if (!trackData() || boxRunning()) return false;
+                  if (solver().requiresDepth && depthFrames().length === 0) return false;
+                  return true;
+                };
+                const tip = () => {
+                  if (!trackData()) return "Run tracking first";
+                  if (solver().requiresDepth && depthFrames().length === 0) {
+                    return `${solver().label} needs depth maps — run a scene plugin first`;
+                  }
+                  if (boxResult()?.num_frames_with_boxes) {
+                    return `${solver().label} produced 3D boxes on ${boxResult()!.num_frames_with_boxes} frames. Click to re-run.`;
+                  }
+                  return `Run ${solver().label} 3D bounding box lifting on the tracked frames.`;
+                };
+                return (
+                  <button
+                    style={{ ...accentBtnStyle(enabled(), ready()), width: "100%" }}
+                    title={tip()}
+                    onClick={runBoxSolver}
+                    disabled={!enabled()}
+                  >
+                    {boxRunning() ? "Running..." : "Compute Boxes"}
+                  </button>
+                );
+              })()}
             </div>
 
             {/* Mesh Reconstruction */}
@@ -2017,8 +2041,8 @@ export default function App() {
                 depthStem={depthStem()}
                 cameras={cameras()}
                 visible={viewTab() === "3d" || viewTab() === "3d-scene"}
-                boxerResult={boxerResult()}
-                wilddetResult={wilddetResult()}
+                boxResult={boxResult()}
+                boxSolverId={boxSolverId()}
                 sceneSource={sceneSource()}
                 usePointmap={pointmapView()}
                 scenePointmapMode={viewTab() === "3d-scene"}

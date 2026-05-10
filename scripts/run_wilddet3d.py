@@ -1,8 +1,8 @@
 """Lift per-frame 2D bounding boxes to 3D using WildDet3D.
 
 Usage:
-    python run_wilddet3d.py <scene_dir> <analysis_dir> [--label LABEL]
-        [--source colmap|cut3r] [--use-intrinsics] [--use-depth]
+    python run_wilddet3d.py <scene_dir> <analysis_dir> --out-dir <out_dir> \
+        [--label LABEL] [--source colmap|cut3r] [--use-intrinsics] [--use-depth]
         [--thresh3d 0.3]
 
 Reads:
@@ -11,7 +11,7 @@ Reads:
     <analysis_dir>/track.json         — per-frame 2D bboxes from SAM2 tracking
 
 Outputs:
-    <analysis_dir>/wilddet3d.json     — per-frame 3D oriented bounding boxes
+    <out_dir>/boxes.json              — per-frame 3D oriented bounding boxes
 """
 
 import sys
@@ -121,6 +121,8 @@ def main():
     parser = argparse.ArgumentParser(description="WildDet3D 3D bbox lifting")
     parser.add_argument("scene_dir", help="Scene directory with frames/ and cameras")
     parser.add_argument("analysis_dir", help="Analysis directory with track.json")
+    parser.add_argument("--out-dir", required=True,
+                        help="Directory to write boxes.json into (created if missing)")
     parser.add_argument("--label", default="object", help="Object label")
     parser.add_argument("--source", default="colmap", choices=["colmap", "cut3r", "wilddet3d", "vggt", "da3", "pi3", "mapanything", "worldmirror", "worldmirror2"])
     parser.add_argument("--use-intrinsics", action="store_true",
@@ -351,7 +353,8 @@ def main():
         "frames": results,
     }
 
-    out_path = os.path.join(analysis_dir, "wilddet3d.json")
+    os.makedirs(args.out_dir, exist_ok=True)
+    out_path = os.path.join(args.out_dir, "boxes.json")
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
     print(f"[wilddet3d] Wrote {out_path}")

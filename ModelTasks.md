@@ -258,8 +258,9 @@ Driven by the SAM2 click-to-track flow in the UI. All outputs land in
 - **Inputs**: `<scene>/<source>/cameras.json`, `<scene>/<depth_dir>/`
   (optionally pointmaps for cut3r/vggt/da3/pi3/mapanything/worldmirror*),
   `<analysis>/track.json`.
-- **Output**: `<analysis>/boxer.json` (per-frame OBBs + optional fused
-  static instances).
+- **Output**: `<analysis>/boxer/boxes.json` (per-frame OBBs + optional
+  fused static instances). Output dir is passed via `--out-dir` so
+  multiple solvers can co-exist for one analysis run.
 - **Notes**: Rotates the world into Boxer's gravity convention
   (gravity = `[0,0,-1]`) before inference, rotates results back.
 
@@ -267,7 +268,7 @@ Driven by the SAM2 click-to-track flow in the UI. All outputs land in
 - **External**: same `..\..\wilddet3d` checkout as the scene plugin;
   also needs `..\..\wilddet3d\pretrained\sam3\sam3_detector.pt`.
 - **Inputs / outputs**: like `run_boxer.py`, writing
-  `<analysis>/wilddet3d.json`.
+  `<analysis>/wilddet3d/boxes.json` (with `--out-dir` from the server).
 - **Notes**: Runs on every ~10th frame and propagates to neighboring
   frames using the nearest preceding keyframe.
 

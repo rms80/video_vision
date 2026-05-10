@@ -37,8 +37,10 @@ export interface ThreeDepthViewerProps {
   cameras: CamerasJson | null;
   visible: boolean;
   downsample?: number;
-  boxerResult: BoxerResult | null;
-  wilddetResult: BoxerResult | null;
+  /** 3D-box result for the currently selected solver, or null if none. */
+  boxResult: BoxerResult | null;
+  /** ID of the solver that produced boxResult — drives the box wireframe color. */
+  boxSolverId: string;
   dataVersion?: number;
   sceneSource?: string;
   usePointmap?: boolean;
@@ -471,11 +473,19 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
     cameraWorldPositions = [];
   }
 
-  // 3D bounding box visualization
-  let boxerGroup: THREE.Group | null = null;
-  // Per-frame groups so we can show/hide by frame
-  let boxerFrameGroups: Map<number, THREE.Group> = new Map();
-  let currentBoxerFrame: number | null = null;
+  // 3D bounding box visualization (one solver active at a time).
+  // Per-frame groups so we can show/hide by frame.
+  let boxesGroup: THREE.Group | null = null;
+  let boxFrameGroups: Map<number, THREE.Group> = new Map();
+  let currentBoxFrame: number | null = null;
+
+  // Wireframe colors per solver. Boxer keeps the established orange/green-fused
+  // palette; WildDet3D stays cyan so the two are visually distinct when the
+  // user toggles between them.
+  const SOLVER_COLORS: Record<string, { perFrame: number; fused: number }> = {
+    boxer: { perFrame: 0xff8800, fused: 0x00ff88 },
+    wilddet3d: { perFrame: 0x00ccff, fused: 0x00ccff },
+  };
 
   function makeTextSprite(text: string, color: string): THREE.Sprite {
     const canvas = document.createElement("canvas");
@@ -549,35 +559,38 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
     }
   }
 
-  function buildBoxerBoxes(result: BoxerResult) {
+  function buildBoxes(result: BoxerResult, solverId: string) {
     if (!scene) return;
-    disposeBoxerBoxes();
+    disposeBoxes();
 
-    boxerGroup = new THREE.Group();
-    scene.add(boxerGroup);
+    boxesGroup = new THREE.Group();
+    scene.add(boxesGroup);
 
-    const boxMat = new THREE.LineBasicMaterial({ color: 0xff8800, linewidth: 2 });
-    const fusedMat = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 2 });
+    const colors = SOLVER_COLORS[solverId] ?? SOLVER_COLORS.boxer;
+    const boxMat = new THREE.LineBasicMaterial({ color: colors.perFrame, linewidth: 2 });
+    const fusedMat = new THREE.LineBasicMaterial({ color: colors.fused, linewidth: 2 });
 
     const hasFused = !!(result.fused_boxes && result.fused_boxes.length > 0);
 
     // If fused boxes exist, show them as always-visible static boxes with dimensions
     if (hasFused) {
       for (const box of result.fused_boxes!) {
-        buildBoxWireframe(box, boxerGroup, fusedMat, true);
+        buildBoxWireframe(box, boxesGroup, fusedMat, true);
       }
     }
 
-    // Also build per-frame boxes (shown per-frame)
-    const perFrameMat = hasFused ?
-      new THREE.LineBasicMaterial({ color: 0xff8800, opacity: 0.6, transparent: true }) : boxMat;
+    // Also build per-frame boxes (shown per-frame); fade them when fused
+    // boxes are the primary readout.
+    const perFrameMat = hasFused
+      ? new THREE.LineBasicMaterial({ color: colors.perFrame, opacity: 0.6, transparent: true })
+      : boxMat;
 
     for (const frame of result.frames) {
       if (frame.boxes.length === 0) continue;
       const frameGroup = new THREE.Group();
       frameGroup.visible = false;
-      boxerGroup.add(frameGroup);
-      boxerFrameGroups.set(frame.frame, frameGroup);
+      boxesGroup.add(frameGroup);
+      boxFrameGroups.set(frame.frame, frameGroup);
 
       for (const box of frame.boxes) {
         buildBoxWireframe(box, frameGroup, perFrameMat, !hasFused);
@@ -585,33 +598,32 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
     }
 
     // Show the per-frame box for the current frame immediately
-    currentBoxerFrame = null;
-    updateBoxerFrame(props.currentFrame);
+    currentBoxFrame = null;
+    updateBoxFrame(props.currentFrame);
   }
 
-  function updateBoxerFrame(frameIdx: number) {
-    if (!boxerGroup || boxerFrameGroups.size === 0) return;
+  function updateBoxFrame(frameIdx: number) {
+    if (!boxesGroup || boxFrameGroups.size === 0) return;
 
-    // Find nearest boxer frame
+    // Find nearest box frame
     let bestFrame = -1;
     let bestDist = Infinity;
-    for (const fIdx of boxerFrameGroups.keys()) {
+    for (const fIdx of boxFrameGroups.keys()) {
       const d = Math.abs(fIdx - frameIdx);
       if (d < bestDist) { bestDist = d; bestFrame = fIdx; }
     }
 
-    if (bestFrame === currentBoxerFrame) return;
-    currentBoxerFrame = bestFrame;
+    if (bestFrame === currentBoxFrame) return;
+    currentBoxFrame = bestFrame;
 
-    // Show nearest, hide others
-    for (const [fIdx, group] of boxerFrameGroups) {
+    for (const [fIdx, group] of boxFrameGroups) {
       group.visible = fIdx === bestFrame;
     }
   }
 
-  function disposeBoxerBoxes() {
-    if (boxerGroup && scene) {
-      boxerGroup.traverse((obj) => {
+  function disposeBoxes() {
+    if (boxesGroup && scene) {
+      boxesGroup.traverse((obj) => {
         if (obj instanceof THREE.LineSegments) {
           obj.geometry.dispose();
           if (obj.material instanceof THREE.Material) obj.material.dispose();
@@ -621,78 +633,11 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
           mat.dispose();
         }
       });
-      scene.remove(boxerGroup);
+      scene.remove(boxesGroup);
     }
-    boxerGroup = null;
-    boxerFrameGroups = new Map();
-    currentBoxerFrame = null;
-  }
-
-  // --- WildDet3D boxes (cyan) ---
-  let wilddetGroup: THREE.Group | null = null;
-  let wilddetFrameGroups: Map<number, THREE.Group> = new Map();
-  let currentWilddetFrame: number | null = null;
-
-  function buildWilddetBoxes(result: BoxerResult) {
-    if (!scene) return;
-    disposeWilddetBoxes();
-
-    wilddetGroup = new THREE.Group();
-    scene.add(wilddetGroup);
-
-    const boxMat = new THREE.LineBasicMaterial({ color: 0x00ccff, linewidth: 2 });
-
-    for (const frame of result.frames) {
-      if (frame.boxes.length === 0) continue;
-      const frameGroup = new THREE.Group();
-      frameGroup.visible = false;
-      wilddetGroup.add(frameGroup);
-      wilddetFrameGroups.set(frame.frame, frameGroup);
-
-      for (const box of frame.boxes) {
-        buildBoxWireframe(box, frameGroup, boxMat, true);
-      }
-    }
-
-    currentWilddetFrame = null;
-    updateWilddetFrame(props.currentFrame);
-  }
-
-  function updateWilddetFrame(frameIdx: number) {
-    if (!wilddetGroup || wilddetFrameGroups.size === 0) return;
-
-    let bestFrame = -1;
-    let bestDist = Infinity;
-    for (const fIdx of wilddetFrameGroups.keys()) {
-      const d = Math.abs(fIdx - frameIdx);
-      if (d < bestDist) { bestDist = d; bestFrame = fIdx; }
-    }
-
-    if (bestFrame === currentWilddetFrame) return;
-    currentWilddetFrame = bestFrame;
-
-    for (const [fIdx, group] of wilddetFrameGroups) {
-      group.visible = fIdx === bestFrame;
-    }
-  }
-
-  function disposeWilddetBoxes() {
-    if (wilddetGroup && scene) {
-      wilddetGroup.traverse((obj) => {
-        if (obj instanceof THREE.LineSegments) {
-          obj.geometry.dispose();
-          if (obj.material instanceof THREE.Material) obj.material.dispose();
-        } else if (obj instanceof THREE.Sprite) {
-          const mat = obj.material as THREE.SpriteMaterial;
-          mat.map?.dispose();
-          mat.dispose();
-        }
-      });
-      scene.remove(wilddetGroup);
-    }
-    wilddetGroup = null;
-    wilddetFrameGroups = new Map();
-    currentWilddetFrame = null;
+    boxesGroup = null;
+    boxFrameGroups = new Map();
+    currentBoxFrame = null;
   }
 
   function disposeMeshes() {
@@ -773,8 +718,7 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
   }
 
   function disposeAll() {
-    disposeBoxerBoxes();
-    disposeWilddetBoxes();
+    disposeBoxes();
     disposeMeshes();
     disposeScenePointmap();
     disposeCameraPath();
@@ -968,45 +912,27 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
     },
   ));
 
-  // Build 3D boxes when boxer result changes
+  // Rebuild box wireframes when the active solver result (or its solver id)
+  // changes. The solver id drives wireframe color, so a solver switch must
+  // also trigger a rebuild even if the underlying BoxerResult object happens
+  // to be reference-equal across the swap.
   createEffect(on(
-    () => props.boxerResult,
-    (result) => {
+    () => [props.boxResult, props.boxSolverId] as const,
+    ([result, solverId]) => {
       if (result && scene) {
-        buildBoxerBoxes(result);
+        buildBoxes(result, solverId);
       } else {
-        disposeBoxerBoxes();
+        disposeBoxes();
       }
     },
   ));
 
-  // Update visible boxer frame when current frame changes
+  // Update visible per-frame box when the playhead moves
   createEffect(on(
-    () => [props.currentFrame, props.visible, props.boxerResult] as const,
+    () => [props.currentFrame, props.visible, props.boxResult] as const,
     ([frame, visible]) => {
       if (!visible) return;
-      updateBoxerFrame(frame);
-    },
-  ));
-
-  // Build WildDet3D boxes when result changes
-  createEffect(on(
-    () => props.wilddetResult,
-    (result) => {
-      if (result && scene) {
-        buildWilddetBoxes(result);
-      } else {
-        disposeWilddetBoxes();
-      }
-    },
-  ));
-
-  // Update visible WildDet3D frame when current frame changes
-  createEffect(on(
-    () => [props.currentFrame, props.visible, props.wilddetResult] as const,
-    ([frame, visible]) => {
-      if (!visible) return;
-      updateWilddetFrame(frame);
+      updateBoxFrame(frame);
     },
   ));
 
@@ -1064,8 +990,7 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
       if (sceneMode && visible) {
         // Entering scene pointmap mode: hide per-frame meshes, boxes, cameras
         if (meshGroup) meshGroup.visible = false;
-        if (boxerGroup) boxerGroup.visible = false;
-        if (wilddetGroup) wilddetGroup.visible = false;
+        if (boxesGroup) boxesGroup.visible = false;
         if (cameraPathLine) cameraPathLine.visible = false;
         if (cameraMarker) cameraMarker.visible = false;
         for (const f of cameraFrustums) f.visible = false;
@@ -1079,15 +1004,10 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
         disposeScenePointmap();
         if (meshGroup) meshGroup.visible = true;
         if (currentShownFrame != null) showOnlyMesh(currentShownFrame);
-        if (boxerGroup) {
-          boxerGroup.visible = true;
-          currentBoxerFrame = null;  // force re-evaluation
-          updateBoxerFrame(props.currentFrame);
-        }
-        if (wilddetGroup) {
-          wilddetGroup.visible = true;
-          currentWilddetFrame = null;  // force re-evaluation
-          updateWilddetFrame(props.currentFrame);
+        if (boxesGroup) {
+          boxesGroup.visible = true;
+          currentBoxFrame = null;  // force re-evaluation
+          updateBoxFrame(props.currentFrame);
         }
         const showPath = props.showCameraPath !== false;
         if (cameraPathLine) cameraPathLine.visible = showPath;

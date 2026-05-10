@@ -1,7 +1,8 @@
 """Lift per-frame 2D bounding boxes to 3D using Facebook's Boxer model.
 
 Usage:
-    python run_boxer.py <scene_dir> <analysis_dir> [--label LABEL] [--thresh3d 0.5]
+    python run_boxer.py <scene_dir> <analysis_dir> --out-dir <out_dir> \
+        [--label LABEL] [--thresh3d 0.5]
 
 Reads:
     <scene_dir>/<source>/cameras.json  — camera intrinsics + per-frame poses
@@ -9,7 +10,7 @@ Reads:
     <analysis_dir>/track.json         — per-frame 2D bboxes from SAM2 tracking
 
 Outputs:
-    <analysis_dir>/boxer.json         — per-frame 3D oriented bounding boxes
+    <out_dir>/boxes.json              — per-frame 3D oriented bounding boxes
 """
 
 import os
@@ -201,6 +202,8 @@ def main():
     parser = argparse.ArgumentParser(description="Lift 2D boxes to 3D with Boxer")
     parser.add_argument("scene_dir", help="Path to _scene directory")
     parser.add_argument("analysis_dir", help="Path to analysis run directory")
+    parser.add_argument("--out-dir", required=True,
+                        help="Directory to write boxes.json into (created if missing)")
     parser.add_argument("--label", default="object", help="Object label for detection")
     parser.add_argument("--thresh3d", type=float, default=0.3,
                         help="3D confidence threshold")
@@ -468,7 +471,8 @@ def main():
     if fused_boxes:
         output["fused_boxes"] = fused_boxes
 
-    out_path = os.path.join(analysis_dir, "boxer.json")
+    os.makedirs(args.out_dir, exist_ok=True)
+    out_path = os.path.join(args.out_dir, "boxes.json")
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
     print(f"[boxer] Wrote {out_path}")

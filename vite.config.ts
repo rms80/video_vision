@@ -11,6 +11,10 @@ import {
   type ScenePlugin,
   type PipelineStep,
 } from "./src/scenePlugins";
+import {
+  BOX_SOLVER_PLUGINS,
+  BOX_SOLVER_PLUGINS_BY_ID,
+} from "./src/boxSolverPlugins";
 
 const UPLOADS_DIR = path.resolve(__dirname, "uploads");
 const TMP_DIR = path.resolve(__dirname, "tmp");
@@ -62,16 +66,18 @@ function sceneDir(video: string) {
   return path.join(ANALYSIS_DIR, stem, "_scene");
 }
 
-function deleteBoxerResults(video: string) {
+function deleteBoxSolverResults(video: string) {
   const stem = path.basename(video, path.extname(video));
   const videoDir = path.join(ANALYSIS_DIR, stem);
   if (!fs.existsSync(videoDir)) return;
   for (const name of fs.readdirSync(videoDir)) {
     if (name.startsWith("_")) continue;
-    const boxerPath = path.join(videoDir, name, "boxer.json");
-    if (fs.existsSync(boxerPath)) {
-      fs.unlinkSync(boxerPath);
-      console.log(`[boxer] deleted ${boxerPath}`);
+    for (const solver of BOX_SOLVER_PLUGINS) {
+      const solverDir = path.join(videoDir, name, solver.subdir);
+      if (fs.existsSync(solverDir)) {
+        fs.rmSync(solverDir, { recursive: true, force: true });
+        console.log(`[box-solver] deleted ${solverDir}`);
+      }
     }
   }
 }
@@ -302,7 +308,7 @@ function segViewerPlugin(): Plugin {
                 args: ["$VIDEO", "$SCENE"],
               });
             }
-            deleteBoxerResults(video);
+            deleteBoxSolverResults(video);
             if (plugin.cleanDir) {
               const d = path.join(sd, plugin.cleanDir);
               if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
@@ -386,7 +392,7 @@ function segViewerPlugin(): Plugin {
             const scriptPath = path.join(SCRIPTS_DIR, "align_scene.py");
             const pointsJson = JSON.stringify(points);
             const logPath = path.join(sd, "align.log");
-            deleteBoxerResults(video);
+            deleteBoxSolverResults(video);
             // Read worldup ID to stamp into cameras.json
             const wuPath = path.join(sd, "worldup.json");
             let worldupId = "";
@@ -670,8 +676,16 @@ function segViewerPlugin(): Plugin {
             }
 
             const scriptPath = path.join(SCRIPTS_DIR, "track_object.py");
-            const boxerPath = path.join(runDir, "boxer.json");
-            if (fs.existsSync(boxerPath)) { fs.unlinkSync(boxerPath); console.log(`[track] deleted ${boxerPath}`); }
+            // Re-tracking invalidates any prior 3D-box solver outputs for
+            // this analysis (boxes are anchored to the previous track), so
+            // wipe both solver subdirs.
+            for (const solver of BOX_SOLVER_PLUGINS) {
+              const solverDir = path.join(runDir, solver.subdir);
+              if (fs.existsSync(solverDir)) {
+                fs.rmSync(solverDir, { recursive: true, force: true });
+                console.log(`[track] cleared ${solverDir}`);
+              }
+            }
             console.log(`[track] running ${scriptPath} on ${video} (${analysis})`);
             await new Promise<void>((resolve, reject) => {
               const py = spawn(VENV_PYTHON, [scriptPath, videoPath, detectJsonPath, runDir]);
@@ -775,19 +789,28 @@ function segViewerPlugin(): Plugin {
         res.end(JSON.stringify(result));
       });
 
-      // POST /api/boxer — run Boxer 3D bbox lifting
-      // body: { video, analysis, label }
-      server.middlewares.use("/api/boxer", (req, res, next) => {
+      // POST /api/box-solver — run a 3D bbox lifting solver (Boxer or WildDet3D)
+      // body: { video, analysis, solverId, label, source, options }
+      // Result lands at <analysis>/<solver.subdir>/<solver.resultFile>; both
+      // solvers can co-exist for the same analysis run.
+      server.middlewares.use("/api/box-solver", (req, res, next) => {
         if (req.method !== "POST") return next();
         let body = "";
         req.on("data", (chunk: Buffer) => (body += chunk.toString()));
         req.on("end", async () => {
           try {
-            const { video, analysis, label, fuse, source } = JSON.parse(body);
-            if (!video || !analysis) {
+            const { video, analysis, solverId, label, source, options = {} } = JSON.parse(body);
+            if (!video || !analysis || !solverId) {
               res.statusCode = 400;
               res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: "Missing video or analysis" }));
+              res.end(JSON.stringify({ error: "Missing video, analysis, or solverId" }));
+              return;
+            }
+            const solver = BOX_SOLVER_PLUGINS_BY_ID[solverId];
+            if (!solver) {
+              res.statusCode = 400;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: `Unknown solverId: ${solverId}` }));
               return;
             }
             const stem = path.basename(video, path.extname(video));
@@ -809,22 +832,41 @@ function segViewerPlugin(): Plugin {
               return;
             }
 
-            // Delete stale results so polling doesn't see old runs
-            for (const stale of ["boxer.json", "wilddet3d.json"]) {
-              const p = path.join(runDir, stale);
-              if (fs.existsSync(p)) { fs.unlinkSync(p); console.log(`[boxer] deleted ${p}`); }
+            // Wipe this solver's output dir so polling doesn't see a stale result.
+            // Other solvers' outputs are independent and untouched.
+            const outDir = path.join(runDir, solver.subdir);
+            if (fs.existsSync(outDir)) {
+              fs.rmSync(outDir, { recursive: true, force: true });
+              console.log(`[${solver.id}] cleared ${outDir}`);
+            }
+            fs.mkdirSync(outDir, { recursive: true });
+
+            // Translate the options map into CLI flags. Only the keys declared
+            // in the plugin's options are honored; truthy → emit `--<key-kebab>`.
+            const optionFlags: string[] = [];
+            for (const opt of solver.options) {
+              if (options[opt.key]) {
+                optionFlags.push(`--${opt.key.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase())}`);
+              }
             }
 
-            const scriptPath = path.join(SCRIPTS_DIR, "run_boxer.py");
-            const pyArgs = [sd, runDir, ...(label ? ["--label", label] : []), ...(fuse ? ["--fuse"] : []), ...sourceFlagArgs(plugin)];
-            console.log(`[boxer] running ${scriptPath} on ${video} (${analysis})${fuse ? " +fuse" : ""}`);
+            const scriptPath = path.join(SCRIPTS_DIR, solver.script);
+            const pyArgs = [
+              sd, runDir,
+              "--out-dir", outDir,
+              ...(label ? ["--label", label] : []),
+              ...sourceFlagArgs(plugin),
+              ...optionFlags,
+            ];
+            const flagSummary = optionFlags.length ? ` ${optionFlags.join(" ")}` : "";
+            console.log(`[${solver.id}] running ${scriptPath} on ${video} (${analysis})${flagSummary}`);
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify({ ok: true, status: "running" }));
 
-            const logPath = path.join(runDir, "boxer.log");
+            const logPath = path.join(outDir, solver.logFile);
             runPython(scriptPath, pyArgs, logPath)
-              .then(() => console.log(`[boxer] done: ${video} (${analysis})`))
-              .catch((err) => console.error(`[boxer] failed: ${err}`));
+              .then(() => console.log(`[${solver.id}] done: ${video} (${analysis})`))
+              .catch((err) => console.error(`[${solver.id}] failed: ${err}`));
           } catch (err: any) {
             res.statusCode = 500;
             res.setHeader("Content-Type", "application/json");
@@ -833,91 +875,31 @@ function segViewerPlugin(): Plugin {
         });
       });
 
-      // GET /api/boxer-result?video=<filename>&name=<analysis> — load 3D bbox result
-      server.middlewares.use("/api/boxer-result", (req, res, next) => {
+      // GET /api/box-solver-result?video=<f>&name=<analysis>&solverId=<id> — load result
+      server.middlewares.use("/api/box-solver-result", (req, res, next) => {
         if (req.method !== "GET") return next();
         const url = new URL(req.url!, `http://${req.headers.host}`);
         const video = url.searchParams.get("video");
         const name = url.searchParams.get("name");
-        if (!video || !name) { res.statusCode = 400; res.end(JSON.stringify({ error: "Missing video or name" })); return; }
+        const solverId = url.searchParams.get("solverId");
+        if (!video || !name || !solverId) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: "Missing video, name, or solverId" }));
+          return;
+        }
+        const solver = BOX_SOLVER_PLUGINS_BY_ID[solverId];
+        if (!solver) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: `Unknown solverId: ${solverId}` }));
+          return;
+        }
         const stem = path.basename(video, path.extname(video));
-        const jsonPath = path.join(ANALYSIS_DIR, stem, name, "boxer.json");
-        if (!fs.existsSync(jsonPath)) { res.statusCode = 404; res.end(JSON.stringify({ error: "Boxer result not found" })); return; }
-        const result = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify(result));
-      });
-
-      // POST /api/wilddet3d — run WildDet3D 3D bbox lifting
-      // body: { video, analysis, label, source, useIntrinsics, useDepth }
-      server.middlewares.use("/api/wilddet3d", (req, res, next) => {
-        if (req.method !== "POST") return next();
-        let body = "";
-        req.on("data", (chunk: Buffer) => (body += chunk.toString()));
-        req.on("end", async () => {
-          try {
-            const { video, analysis, label, source, useIntrinsics, useDepth } = JSON.parse(body);
-            if (!video || !analysis) {
-              res.statusCode = 400;
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: "Missing video or analysis" }));
-              return;
-            }
-            const stem = path.basename(video, path.extname(video));
-            const sd = sceneDir(video);
-            const runDir = path.join(ANALYSIS_DIR, stem, analysis);
-            const trackPath = path.join(runDir, "track.json");
-            if (!fs.existsSync(trackPath)) {
-              res.statusCode = 404;
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: "track.json not found — run tracking first" }));
-              return;
-            }
-            const plugin = resolveSourcePlugin(source);
-            const camerasPath = path.join(sd, plugin.camerasDir, "cameras.json");
-            if (!fs.existsSync(camerasPath)) {
-              res.statusCode = 404;
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: `cameras.json not found in ${plugin.camerasDir}` }));
-              return;
-            }
-
-            // Delete stale results so polling doesn't see old runs
-            for (const stale of ["boxer.json", "wilddet3d.json"]) {
-              const p = path.join(runDir, stale);
-              if (fs.existsSync(p)) { fs.unlinkSync(p); console.log(`[wilddet3d] deleted ${p}`); }
-            }
-
-            const scriptPath = path.join(SCRIPTS_DIR, "run_wilddet3d.py");
-            const intrinsicsFlag = useIntrinsics ? ["--use-intrinsics"] : [];
-            const depthFlag = useDepth ? ["--use-depth"] : [];
-            const pyArgs = [sd, runDir, ...(label ? ["--label", label] : []), ...sourceFlagArgs(plugin), ...intrinsicsFlag, ...depthFlag];
-            console.log(`[wilddet3d] running ${scriptPath} on ${video} (${analysis})${useIntrinsics ? " +K" : ""}${useDepth ? " +depth" : ""}`);
-            res.setHeader("Content-Type", "application/json");
-            res.end(JSON.stringify({ ok: true, status: "running" }));
-
-            const logPath = path.join(runDir, "wilddet3d.log");
-            runPython(scriptPath, pyArgs, logPath)
-              .then(() => console.log(`[wilddet3d] done: ${video} (${analysis})`))
-              .catch((err) => console.error(`[wilddet3d] failed: ${err}`));
-          } catch (err: any) {
-            res.statusCode = 500;
-            res.setHeader("Content-Type", "application/json");
-            res.end(JSON.stringify({ error: err.message }));
-          }
-        });
-      });
-
-      // GET /api/wilddet3d-result?video=<filename>&name=<analysis> — load WildDet3D result
-      server.middlewares.use("/api/wilddet3d-result", (req, res, next) => {
-        if (req.method !== "GET") return next();
-        const url = new URL(req.url!, `http://${req.headers.host}`);
-        const video = url.searchParams.get("video");
-        const name = url.searchParams.get("name");
-        if (!video || !name) { res.statusCode = 400; res.end(JSON.stringify({ error: "Missing video or name" })); return; }
-        const stem = path.basename(video, path.extname(video));
-        const jsonPath = path.join(ANALYSIS_DIR, stem, name, "wilddet3d.json");
-        if (!fs.existsSync(jsonPath)) { res.statusCode = 404; res.end(JSON.stringify({ error: "WildDet3D result not found" })); return; }
+        const jsonPath = path.join(ANALYSIS_DIR, stem, name, solver.subdir, solver.resultFile);
+        if (!fs.existsSync(jsonPath)) {
+          res.statusCode = 404;
+          res.end(JSON.stringify({ error: `${solver.label} result not found` }));
+          return;
+        }
         const result = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
         res.setHeader("Content-Type", "application/json");
         res.end(JSON.stringify(result));
