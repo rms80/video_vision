@@ -43,6 +43,7 @@ export default function App() {
   const [duration, setDuration] = createSignal(0);
   const [currentFrame, setCurrentFrame] = createSignal(0);
   const [totalFrames, setTotalFrames] = createSignal(0);
+  const [videoSize, setVideoSize] = createSignal<{ w: number; h: number } | null>(null);
   const fps = () => 30;
   const [dragOver, setDragOver] = createSignal(false);
   const [status, setStatus] = createSignal("Drop a video file to begin");
@@ -207,24 +208,26 @@ export default function App() {
   createEffect(() => localStorage.setItem("segviewer:sceneSource", sceneSource()));
   createEffect(() => localStorage.setItem("segviewer:viewTab", viewTab()));
 
-  // Pi3 subsample rate (shown only when Pi3 is selected).
-  const [pi3Subsample, setPi3Subsample] = createSignal<string>("2");
-  // Restore from cameras.json whenever Pi3 is the active source and its
-  // cameras load (refreshDepthFrames fetches them for the current plugin).
+  // Per-plugin subsample input value, keyed by plugin id. Initialized from
+  // each plugin's subsampleDefault (which mirrors the runner script's own
+  // default), then overwritten by cameras.json `subsample_every` whenever
+  // the active source's analysis is loaded.
+  const [pluginSubsamples, setPluginSubsamples] = createSignal<Record<string, string>>(
+    Object.fromEntries(
+      SCENE_PLUGINS
+        .filter((p) => p.subsampleDefault !== undefined)
+        .map((p) => [p.id, String(p.subsampleDefault)]),
+    ),
+  );
   createEffect(() => {
-    if (sceneSource() !== "pi3") return;
+    const id = sceneSource();
+    const plugin = SCENE_PLUGINS_BY_ID[id];
+    if (!plugin || plugin.subsampleDefault === undefined) return;
     const cam = cameras();
     const n = cam?.subsample_every;
-    if (typeof n === "number" && n > 0) setPi3Subsample(String(n));
-  });
-
-  // DA3 subsample rate (shown only when DA3 is selected).
-  const [da3Subsample, setDa3Subsample] = createSignal<string>("2");
-  createEffect(() => {
-    if (sceneSource() !== "da3") return;
-    const cam = cameras();
-    const n = cam?.subsample_every;
-    if (typeof n === "number" && n > 0) setDa3Subsample(String(n));
+    if (typeof n === "number" && n > 0) {
+      setPluginSubsamples((prev) => ({ ...prev, [id]: String(n) }));
+    }
   });
 
   // VGGT target total-frame count (shown only when VGGT is selected).
@@ -815,12 +818,8 @@ export default function App() {
     setStatus(`Starting ${plugin.label}...`);
     try {
       const options: Record<string, unknown> = {};
-      if (pluginId === "pi3") {
-        const n = Math.max(1, Math.round(Number(pi3Subsample())));
-        if (Number.isFinite(n)) options.subsample = n;
-      }
-      if (pluginId === "da3") {
-        const n = Math.max(1, Math.round(Number(da3Subsample())));
+      if (plugin.subsampleDefault !== undefined) {
+        const n = Math.max(1, Math.round(Number(pluginSubsamples()[pluginId])));
         if (Number.isFinite(n)) options.subsample = n;
       }
       if (pluginId === "vggt") {
@@ -1020,6 +1019,7 @@ export default function App() {
       }
     }
     videoReady = true;
+    setVideoSize({ w: videoEl.videoWidth, h: videoEl.videoHeight });
     setStatus(`Ready: ${videoName()} | ${videoEl.videoWidth}x${videoEl.videoHeight} | ${videoEl.duration.toFixed(1)}s`);
   }
 
@@ -1335,38 +1335,19 @@ export default function App() {
                   {(p) => <option value={p.id}>{p.label}</option>}
                 </For>
               </select>
-              <Show when={sceneSource() === "pi3"}>
+              <Show when={SCENE_PLUGINS_BY_ID[sceneSource()]?.subsampleDefault !== undefined}>
                 <div style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}>
                   <label style={{ "font-size": "11px", color: "#aaa" }}>Subsample every</label>
                   <input
                     type="number"
                     min="1"
                     step="1"
-                    value={pi3Subsample()}
-                    onInput={(e) => setPi3Subsample(e.currentTarget.value)}
-                    style={{
-                      width: "60px",
-                      padding: "4px 6px",
-                      background: "#0a0e1a",
-                      border: "1px solid #0f3460",
-                      color: "#e0e0e0",
-                      "border-radius": "3px",
-                      "font-size": "12px",
-                      "font-family": "inherit",
+                    value={pluginSubsamples()[sceneSource()] ?? ""}
+                    onInput={(e) => {
+                      const id = sceneSource();
+                      const v = e.currentTarget.value;
+                      setPluginSubsamples((prev) => ({ ...prev, [id]: v }));
                     }}
-                  />
-                  <span style={{ "font-size": "11px", color: "#888" }}>frames</span>
-                </div>
-              </Show>
-              <Show when={sceneSource() === "da3"}>
-                <div style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}>
-                  <label style={{ "font-size": "11px", color: "#aaa" }}>Subsample every</label>
-                  <input
-                    type="number"
-                    min="1"
-                    step="1"
-                    value={da3Subsample()}
-                    onInput={(e) => setDa3Subsample(e.currentTarget.value)}
                     style={{
                       width: "60px",
                       padding: "4px 6px",
@@ -2118,7 +2099,30 @@ export default function App() {
               </div>
               <div style={{ display: "flex", "justify-content": "space-between", "font-size": "11px", color: "#888", "margin-top": "4px" }}>
                 <span>Time: {formatTime(currentTime())} / {formatTime(duration())}</span>
-                <span>Frame: {currentFrame()} / {totalFrames()}</span>
+                <div style={{ display: "flex", gap: "12px" }}>
+                  {(() => {
+                    const tab = viewTab();
+                    const size = tab === "source"
+                      ? videoSize()
+                      : (cameras() ? { w: cameras()!.width, h: cameras()!.height } : null);
+                    let kfCount: number | null = null;
+                    if (tab === "depth") {
+                      kfCount = depthFrames().length;
+                    } else if (tab === "3d" || tab === "3d-scene") {
+                      const cam = cameras();
+                      kfCount = cam ? cam.frames.filter((f) => f.registered).length : 0;
+                    }
+                    return (
+                      <>
+                        <span>Resolution: {size ? `${size.w}x${size.h}` : "—"}</span>
+                        <Show when={kfCount !== null}>
+                          <span>Keyframes: {kfCount}</span>
+                        </Show>
+                      </>
+                    );
+                  })()}
+                  <span>Frame: {currentFrame()} / {totalFrames()}</span>
+                </div>
               </div>
             </div>
           </Show>

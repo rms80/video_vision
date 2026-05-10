@@ -35,8 +35,8 @@ def main():
     parser.add_argument("scene_dir", help="Path to _scene directory")
     parser.add_argument("--size", type=int, default=512,
                         help="CUT3R working resolution (default 512)")
-    parser.add_argument("--subsample", type=int, default=1,
-                        help="Use every Nth frame (default 1 = all)")
+    parser.add_argument("--subsample", type=int, default=2,
+                        help="Use every Nth frame (default 2)")
     args = parser.parse_args()
 
     scene_dir = args.scene_dir

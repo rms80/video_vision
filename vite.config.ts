@@ -304,11 +304,11 @@ function segViewerPlugin(): Plugin {
                   const args = step.args.map((a) =>
                     a === "$VIDEO" ? videoPath : a === "$SCENE" ? sd : a,
                   );
-                  if ((plugin.id === "pi3" || plugin.id === "da3")
-                      && (step.script === "run_pi3.py" || step.script === "run_da3.py")
+                  if (plugin.subsampleDefault !== undefined
+                      && (!plugin.subsampleScript || step.script === plugin.subsampleScript)
                       && options && Number.isFinite(Number(options.subsample))) {
                     const n = Math.max(1, Math.round(Number(options.subsample)));
-                    args.push("--subsample", String(n));
+                    args.push(plugin.subsampleFlag ?? "--subsample", String(n));
                   }
                   if (plugin.id === "vggt" && step.script === "run_vggt.py"
                       && options && Number.isFinite(Number(options.numFrames))) {

@@ -59,6 +59,24 @@ export interface ScenePlugin {
     /** Plugin publishes a single scene_pointmap.npz with the global reconstruction. */
     scenePointmap?: boolean;
   };
+  /**
+   * If set, the runner script takes a "use every Nth frame" int and the
+   * UI shows a "Subsample every N frames" input. The number is the
+   * script's own default (kept in sync so the UI matches a no-options run).
+   */
+  subsampleDefault?: number;
+  /**
+   * CLI flag name for the subsample value. Defaults to `--subsample`;
+   * COLMAP uses `--every`. Only consulted when subsampleDefault is set.
+   */
+  subsampleFlag?: string;
+  /**
+   * Restrict the subsample flag to a specific pipeline step (matched by
+   * step.script). Required for multi-step plugins where only one step
+   * accepts the flag (e.g. COLMAP's run_colmap.py). Unset = apply to
+   * every step in the pipeline.
+   */
+  subsampleScript?: string;
 }
 
 export const SCENE_PLUGINS: ScenePlugin[] = [
@@ -72,10 +90,13 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     readyMarkers: ["colmap/cameras.json", "depthanythingv2/meta.json"],
     pipeline: [
       { stage: "frames", script: "extract_frames.py", args: ["$VIDEO", "$SCENE"] },
-      { stage: "colmap", script: "run_colmap.py", args: ["$SCENE", "--every", "3", "--max-size", "1920"] },
+      { stage: "colmap", script: "run_colmap.py", args: ["$SCENE", "--max-size", "1920"] },
       { stage: "depth", script: "run_depth.py", args: ["$SCENE"] },
     ],
     requiresFrames: false,
+    subsampleDefault: 3,
+    subsampleFlag: "--every",
+    subsampleScript: "run_colmap.py",
   },
   {
     id: "cut3r",
@@ -91,6 +112,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "cut3r",
     requiresFrames: true,
     features: { pointmap: true },
+    subsampleDefault: 2,
   },
   {
     id: "vggt",
@@ -121,6 +143,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "da3",
     requiresFrames: true,
     features: { pointmap: true },
+    subsampleDefault: 2,
   },
   {
     id: "pi3",
@@ -136,6 +159,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "pi3",
     requiresFrames: true,
     features: { pointmap: true, scenePointmap: true },
+    subsampleDefault: 2,
   },
   {
     id: "mapanything",
@@ -151,6 +175,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "mapanything",
     requiresFrames: true,
     features: { pointmap: true, scenePointmap: true },
+    subsampleDefault: 3,
   },
   {
     id: "worldmirror2",
@@ -166,6 +191,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "worldmirror2",
     requiresFrames: true,
     features: { pointmap: true, scenePointmap: true },
+    subsampleDefault: 3,
   },
   {
     id: "worldmirror",
@@ -181,6 +207,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "worldmirror",
     requiresFrames: true,
     features: { pointmap: true, scenePointmap: true },
+    subsampleDefault: 3,
   },
   {
     id: "wilddet3d",
@@ -195,6 +222,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     ],
     cleanDir: "wilddet3d",
     requiresFrames: true,
+    subsampleDefault: 10,
   },
 ];
 
