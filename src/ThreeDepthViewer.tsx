@@ -62,8 +62,11 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
   let animId: number | null = null;
   let resizeObs: ResizeObserver | null = null;
 
-  // Mesh cache — maps depth frame index to cached entry (mesh or point cloud)
+  // Mesh cache — maps depth frame index to cached entry (mesh or point cloud).
+  // The cache and meshGroup.children are kept in lockstep: every cached entry
+  // is a child of meshGroup, and disposeMeshes wipes both together.
   const meshCache = new Map<number, CachedEntry>();
+  let meshGroup: THREE.Group | null = null;
   let currentShownFrame: number | null = null;
   // Track loading to avoid double-fetching
   const loadingFrames = new Set<number>();
@@ -98,7 +101,7 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
   }
 
   async function loadAndShowFrame(depthIdx: number) {
-    if (!scene || !props.cameras) return;
+    if (!scene || !meshGroup || !props.cameras) return;
 
     // Already cached?
     const cached = meshCache.get(depthIdx);
@@ -164,7 +167,8 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
         const boxHelper = new THREE.Box3Helper(bbox, new THREE.Color(0x888888));
         points.add(boxHelper);
 
-        scene!.add(points);
+        points.userData.frameIdx = depthIdx;
+        meshGroup!.add(points);
         meshCache.set(depthIdx, { object: points, frameIdx: depthIdx, isPointCloud: true });
       } else {
         // --- Depth mesh path: load depth, unproject through K, render as triangle mesh ---
@@ -211,7 +215,8 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
         const mesh = new THREE.Mesh(geometry, material);
         mesh.visible = false;
 
-        scene!.add(mesh);
+        mesh.userData.frameIdx = depthIdx;
+        meshGroup!.add(mesh);
         meshCache.set(depthIdx, { object: mesh, frameIdx: depthIdx, isPointCloud: false });
       }
 
@@ -226,8 +231,14 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
   }
 
   function showOnlyMesh(depthIdx: number) {
-    for (const [idx, cached] of meshCache) {
-      cached.object.visible = idx === depthIdx;
+    // meshGroup is the single source of truth for per-frame meshes.
+    // Iterating its children (rather than meshCache) defends against any
+    // divergence between cache state and what's actually in the scene.
+    if (meshGroup) {
+      for (const child of meshGroup.children) {
+        const idx = child.userData.frameIdx as number | undefined;
+        child.visible = idx === depthIdx;
+      }
     }
     currentShownFrame = depthIdx;
   }
@@ -694,7 +705,10 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
         mat.map?.dispose();
         mat.dispose();
       }
-      scene?.remove(cached.object);
+    }
+    // Wipe meshGroup wholesale — covers both cached entries and any orphans.
+    if (meshGroup) {
+      while (meshGroup.children.length) meshGroup.remove(meshGroup.children[0]);
     }
     meshCache.clear();
     currentShownFrame = null;
@@ -804,6 +818,8 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
 
     // Scene
     scene = new THREE.Scene();
+    meshGroup = new THREE.Group();
+    scene.add(meshGroup);
 
     // Camera
     camera = new THREE.PerspectiveCamera(60, 1, 0.005, 1000);
@@ -1047,7 +1063,7 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
 
       if (sceneMode && visible) {
         // Entering scene pointmap mode: hide per-frame meshes, boxes, cameras
-        for (const [, cached] of meshCache) cached.object.visible = false;
+        if (meshGroup) meshGroup.visible = false;
         if (boxerGroup) boxerGroup.visible = false;
         if (wilddetGroup) wilddetGroup.visible = false;
         if (cameraPathLine) cameraPathLine.visible = false;
@@ -1061,6 +1077,7 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
       } else if (changed && !sceneMode) {
         // Leaving scene pointmap mode: dispose global cloud, restore everything
         disposeScenePointmap();
+        if (meshGroup) meshGroup.visible = true;
         if (currentShownFrame != null) showOnlyMesh(currentShownFrame);
         if (boxerGroup) {
           boxerGroup.visible = true;
