@@ -2160,10 +2160,19 @@ export default function App() {
                     );
                   }}
                 </Show>
-                {/* World-up point overlays */}
+                {/* World-up point overlays — full opacity on the exact frame
+                    the point was picked on, drop to 0.5 once we step off, then
+                    linearly fade to 0 by FADE_FRAMES away. */}
                 <Show when={floorPoints().length > 0}>
                   <For each={floorPoints()}>
                     {(pt) => {
+                      const FADE_FRAMES = 5;
+                      const alpha = () => {
+                        const d = Math.abs(pt.frame - currentFrame());
+                        if (d === 0) return 1;
+                        if (d >= FADE_FRAMES) return 0;
+                        return 0.5 * (1 - (d - 1) / (FADE_FRAMES - 1));
+                      };
                       const pos = () => {
                         if (!videoEl) return null;
                         const rect = videoEl.getBoundingClientRect();
@@ -2172,22 +2181,26 @@ export default function App() {
                         return { left: pt.x * scaleX, top: pt.y * scaleY };
                       };
                       return (
-                        <Show when={pos()}>
-                          {(p) => (
-                            <div
-                              style={{
-                                position: "absolute",
-                                left: `${p().left - 6}px`,
-                                top: `${p().top - 6}px`,
-                                width: "12px",
-                                height: "12px",
-                                "border-radius": "50%",
-                                background: "rgba(52, 152, 219, 0.7)",
-                                border: "2px solid #3498db",
-                                "pointer-events": "none",
-                              }}
-                            />
-                          )}
+                        <Show when={pos() && alpha() > 0}>
+                          {() => {
+                            const p = pos()!;
+                            return (
+                              <div
+                                style={{
+                                  position: "absolute",
+                                  left: `${p.left - 6}px`,
+                                  top: `${p.top - 6}px`,
+                                  width: "12px",
+                                  height: "12px",
+                                  "border-radius": "50%",
+                                  background: "#fff",
+                                  border: "2px solid #000",
+                                  opacity: `${alpha()}`,
+                                  "pointer-events": "none",
+                                }}
+                              />
+                            );
+                          }}
                         </Show>
                       );
                     }}
