@@ -136,7 +136,8 @@ def clone_repo(url: str, dest: Path, commit: str | None = None,
             print(f"[git] already at {commit}")
         else:
             print(f"[git] checkout {commit}")
-            subprocess.run(["git", "-C", str(dest), "checkout", commit], check=True)
+            # -q suppresses git's detached-HEAD advice; we always pin a commit.
+            subprocess.run(["git", "-C", str(dest), "checkout", "-q", commit], check=True)
             if recursive:
                 subprocess.run(
                     ["git", "-C", str(dest), "submodule", "update", "--init", "--recursive"],
