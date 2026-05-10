@@ -7,6 +7,9 @@ world space (R^T (X - t)). All points are concatenated and written in
 the same Three.js convention as scene_pointmap.npz so the viewer can
 reuse the existing scene-pointmap rendering path.
 
+Output is sharded into <basename>_NNN.npz chunks plus a <basename>_chunks.json
+manifest so the viewer can stream the cloud and render progressively.
+
 Usage:
     python build_object_pointmap.py <scene_dir> <analysis_dir> \
         --source <plugin_id> --depth-dir <plugin/depth> --out OUT.npz
@@ -18,6 +21,8 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+from _pointcloud_io import DEFAULT_CHUNK_SIZE, save_chunked_pointcloud
 
 
 def load_mask(path: Path, target_hw: tuple[int, int]) -> np.ndarray:
@@ -120,16 +125,14 @@ def main() -> None:
     rgbs = np.concatenate(all_rgb, axis=0)
     conf = np.ones(len(pts), dtype=np.float16)
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        args.out,
-        pts3d=pts.astype(np.float16),
-        rgb=rgbs,
-        conf=conf,
+    out_dir = args.out.parent
+    basename = args.out.stem  # strips .npz
+    mp = save_chunked_pointcloud(
+        out_dir, basename, pts, rgbs, conf, chunk_size=DEFAULT_CHUNK_SIZE,
     )
     print(f"[object-pointmap] frames used: {n_used} (skipped {n_skipped})")
     print(f"[object-pointmap] points: {len(pts):,}")
-    print(f"[object-pointmap] wrote {args.out}")
+    print(f"[object-pointmap] wrote {mp} ({len(pts) // DEFAULT_CHUNK_SIZE + 1} chunks)")
 
 
 if __name__ == "__main__":

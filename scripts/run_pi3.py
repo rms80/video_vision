@@ -15,7 +15,8 @@ Outputs:
     <scene_dir>/pi3/cameras.json         — same schema as other plugins
     <scene_dir>/pi3/depth/NNNNNN.npz     — per-frame depth
     <scene_dir>/pi3/pointmap/NNNNNN.npz  — per-frame camera-space pointmap + conf
-    <scene_dir>/pi3/scene_pointmap.npz   — global reconstruction (world-space pts + rgb + conf)
+    <scene_dir>/pi3/scene_pointmap_chunks.json — manifest for the global cloud
+    <scene_dir>/pi3/scene_pointmap_NNN.npz     — chunked global cloud (streamed)
 """
 
 import sys
@@ -32,6 +33,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
+
+from _pointcloud_io import save_chunked_pointcloud
 
 
 PIXEL_LIMIT = 255_000
@@ -226,13 +229,7 @@ def main():
     scene_pts[:, 1] *= -1
     scene_pts[:, 2] *= -1
 
-    scene_path = os.path.join(out_dir, "scene_pointmap.npz")
-    np.savez_compressed(
-        scene_path,
-        pts3d=scene_pts.astype(np.float16),
-        rgb=scene_rgb.astype(np.uint8),
-        conf=scene_conf.astype(np.float16),
-    )
+    save_chunked_pointcloud(out_dir, "scene_pointmap", scene_pts, scene_rgb, scene_conf)
     print(f"[pi3] Scene pointmap: {scene_pts.shape[0]:,} points")
 
     # ---- Write cameras.json ----

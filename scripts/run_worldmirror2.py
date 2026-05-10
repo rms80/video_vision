@@ -19,7 +19,8 @@ Outputs:
     <scene_dir>/worldmirror2/cameras.json         — same schema as other plugins
     <scene_dir>/worldmirror2/depth/NNNNNN.npz     — per-frame depth
     <scene_dir>/worldmirror2/pointmap/NNNNNN.npz  — per-frame camera-space pointmap + conf
-    <scene_dir>/worldmirror2/scene_pointmap.npz   — global reconstruction (world + flip)
+    <scene_dir>/worldmirror2/scene_pointmap_chunks.json — global cloud manifest
+    <scene_dir>/worldmirror2/scene_pointmap_NNN.npz     — chunked global cloud
 """
 
 import sys
@@ -30,6 +31,8 @@ import glob
 import time
 import types
 from pathlib import Path
+
+from _pointcloud_io import save_chunked_pointcloud
 
 # Make the HY-World-2.0 checkout importable.
 HYWORLD2_ROOT = Path(__file__).resolve().parent.parent / "models" / "external" / "hy-world-2.0"
@@ -255,13 +258,7 @@ def main():
     scene_pts[:, 1] *= -1
     scene_pts[:, 2] *= -1
 
-    scene_path = os.path.join(out_dir, "scene_pointmap.npz")
-    np.savez_compressed(
-        scene_path,
-        pts3d=scene_pts.astype(np.float16),
-        rgb=scene_rgb.astype(np.uint8),
-        conf=scene_conf.astype(np.float16),
-    )
+    save_chunked_pointcloud(out_dir, "scene_pointmap", scene_pts, scene_rgb, scene_conf)
     print(f"[worldmirror2] Scene pointmap: {scene_pts.shape[0]:,} points")
 
     cameras = {

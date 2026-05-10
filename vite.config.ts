@@ -51,9 +51,34 @@ const objectPointmapJobs = new Map<string, ObjectPointmapJobState>();
 
 const OBJECT_POINTMAP_DIR = "object_pointmap";
 
-function objectPointmapPath(video: string, analysis: string, source: string): string {
+/**
+ * The object cloud is sharded by build_object_pointmap.py into
+ * <source>_chunks.json + <source>_NNN.npz. The .npz path passed to that
+ * script is just used as the basename ("<source>"); the manifest is what
+ * the client fetches first and what we use as the readiness marker.
+ */
+function objectPointmapBasePath(video: string, analysis: string): string {
   const stem = path.basename(video, path.extname(video));
-  return path.join(ANALYSIS_DIR, stem, analysis, OBJECT_POINTMAP_DIR, `${source}.npz`);
+  return path.join(ANALYSIS_DIR, stem, analysis, OBJECT_POINTMAP_DIR);
+}
+
+function objectPointmapOutArg(video: string, analysis: string, source: string): string {
+  // Python derives the chunk basename from `args.out.stem`.
+  return path.join(objectPointmapBasePath(video, analysis), `${source}.npz`);
+}
+
+function objectPointmapManifestPath(video: string, analysis: string, source: string): string {
+  return path.join(objectPointmapBasePath(video, analysis), `${source}_chunks.json`);
+}
+
+function deleteObjectPointmapChunks(dir: string, source: string) {
+  if (!fs.existsSync(dir)) return;
+  const manifest = path.join(dir, `${source}_chunks.json`);
+  if (fs.existsSync(manifest)) fs.rmSync(manifest, { force: true });
+  const chunkRe = new RegExp(`^${source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}_\\d{3}\\.npz$`);
+  for (const name of fs.readdirSync(dir)) {
+    if (chunkRe.test(name)) fs.rmSync(path.join(dir, name), { force: true });
+  }
 }
 
 /**
@@ -67,11 +92,8 @@ function deleteObjectPointmapsForSource(video: string, source: string) {
   if (!fs.existsSync(videoDir)) return;
   for (const name of fs.readdirSync(videoDir)) {
     if (name.startsWith("_")) continue;
-    const file = path.join(videoDir, name, OBJECT_POINTMAP_DIR, `${source}.npz`);
-    if (fs.existsSync(file)) {
-      fs.rmSync(file, { force: true });
-      console.log(`[object-pointmap] deleted ${file}`);
-    }
+    const dir = path.join(videoDir, name, OBJECT_POINTMAP_DIR);
+    deleteObjectPointmapChunks(dir, source);
   }
 }
 
@@ -988,12 +1010,12 @@ function segViewerPlugin(): Plugin {
               return;
             }
 
-            const outPath = objectPointmapPath(video, analysis, plugin.id);
-            const outDir = path.dirname(outPath);
+            const outPath = objectPointmapOutArg(video, analysis, plugin.id);
+            const outDir = objectPointmapBasePath(video, analysis);
             fs.mkdirSync(outDir, { recursive: true });
-            // Wipe any prior .npz for this source so /api/object-pointmap-status
-            // doesn't see a stale "ready" while the rebuild is in flight.
-            if (fs.existsSync(outPath)) fs.rmSync(outPath, { force: true });
+            // Wipe any prior chunks/manifest for this source so the readiness
+            // check doesn't see a stale manifest while the rebuild is in flight.
+            deleteObjectPointmapChunks(outDir, plugin.id);
             const logPath = path.join(outDir, `${plugin.id}.log`);
 
             const state: ObjectPointmapJobState = {
@@ -1051,7 +1073,7 @@ function segViewerPlugin(): Plugin {
         }
         const plugin = resolveSourcePlugin(sourceParam);
         const job = objectPointmapJobs.get(`${video}::${analysis}::${plugin.id}`) ?? null;
-        const ready = fs.existsSync(objectPointmapPath(video, analysis, plugin.id));
+        const ready = fs.existsSync(objectPointmapManifestPath(video, analysis, plugin.id));
         res.setHeader("Content-Type", "application/json");
         res.end(JSON.stringify({ job, ready, source: plugin.id }));
       });

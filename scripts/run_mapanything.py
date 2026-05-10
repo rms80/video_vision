@@ -14,7 +14,8 @@ Outputs:
     <scene_dir>/mapanything/cameras.json         — same schema as other plugins
     <scene_dir>/mapanything/depth/NNNNNN.npz     — per-frame depth
     <scene_dir>/mapanything/pointmap/NNNNNN.npz  — per-frame camera-space pointmap + conf
-    <scene_dir>/mapanything/scene_pointmap.npz   — global reconstruction
+    <scene_dir>/mapanything/scene_pointmap_chunks.json — global cloud manifest
+    <scene_dir>/mapanything/scene_pointmap_NNN.npz     — chunked global cloud
 """
 
 import sys
@@ -28,6 +29,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from _pointcloud_io import save_chunked_pointcloud
 
 
 CONF_THRESHOLD = 0.1
@@ -214,13 +217,7 @@ def main():
     scene_pts[:, 1] *= -1
     scene_pts[:, 2] *= -1
 
-    scene_path = os.path.join(out_dir, "scene_pointmap.npz")
-    np.savez_compressed(
-        scene_path,
-        pts3d=scene_pts.astype(np.float16),
-        rgb=scene_rgb.astype(np.uint8),
-        conf=scene_conf.astype(np.float16),
-    )
+    save_chunked_pointcloud(out_dir, "scene_pointmap", scene_pts, scene_rgb, scene_conf)
     print(f"[mapanything] Scene pointmap: {scene_pts.shape[0]:,} points")
 
     # ---- Write cameras.json ----

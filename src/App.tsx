@@ -144,16 +144,21 @@ export default function App() {
   const [objectPointmapRunning, setObjectPointmapRunning] = createSignal(false);
   const [objectPointmapReady, setObjectPointmapReady] = createSignal(false);
   // Scene-pointmap fetch status (driven by ThreeDepthViewer.onScenePointmapStatus).
-  // `progress` is null when Content-Length isn't reported; `pointCount` is
-  // null until the cloud has been parsed and added to the scene.
+  // `progress` is null until the manifest reports total bytes; `pointCount`
+  // is null until the first chunk lands; chunk counters are null until the
+  // manifest itself has been fetched.
   const [scenePmLoading, setScenePmLoading] = createSignal(false);
   const [scenePmProgress, setScenePmProgress] = createSignal<number | null>(null);
   const [scenePmPoints, setScenePmPoints] = createSignal<number | null>(null);
+  const [scenePmChunksLoaded, setScenePmChunksLoaded] = createSignal<number | null>(null);
+  const [scenePmTotalChunks, setScenePmTotalChunks] = createSignal<number | null>(null);
   // Object-pointmap fetch status — same contract as scenePm*, scoped to the
   // 3D (Object) tab.
   const [objectPmLoading, setObjectPmLoading] = createSignal(false);
   const [objectPmProgress, setObjectPmProgress] = createSignal<number | null>(null);
   const [objectPmPoints, setObjectPmPoints] = createSignal<number | null>(null);
+  const [objectPmChunksLoaded, setObjectPmChunksLoaded] = createSignal<number | null>(null);
+  const [objectPmTotalChunks, setObjectPmTotalChunks] = createSignal<number | null>(null);
   const [pointmapView, setPointmapView] = createSignal(false);
   const [dataVersion, setDataVersion] = createSignal(0);
   const [showCameraPath, setShowCameraPath] = createSignal(true);
@@ -531,8 +536,10 @@ export default function App() {
   }
 
   function objectPointmapUrl(video: string, analysis: string, source: string): string {
+    // Returns the chunk-manifest URL. The viewer fetches this first, then
+    // streams each <source>_NNN.npz chunk listed inside it.
     const stem = video.replace(/\.[^.]+$/, "");
-    return `/analysis/${encodeURIComponent(stem)}/${encodeURIComponent(analysis)}/object_pointmap/${encodeURIComponent(source)}.npz`;
+    return `/analysis/${encodeURIComponent(stem)}/${encodeURIComponent(analysis)}/object_pointmap/${encodeURIComponent(source)}_chunks.json`;
   }
 
   async function refreshObjectPointmap(video: string, analysis: string, source: string) {
@@ -2040,11 +2047,15 @@ export default function App() {
                   setScenePmLoading(s.loading);
                   setScenePmProgress(s.progress);
                   setScenePmPoints(s.pointCount);
+                  setScenePmChunksLoaded(s.chunksLoaded);
+                  setScenePmTotalChunks(s.totalChunks);
                 }}
                 onObjectPointmapStatus={(s) => {
                   setObjectPmLoading(s.loading);
                   setObjectPmProgress(s.progress);
                   setObjectPmPoints(s.pointCount);
+                  setObjectPmChunksLoaded(s.chunksLoaded);
+                  setObjectPmTotalChunks(s.totalChunks);
                 }}
               />
               {/* Source video view */}
@@ -2201,40 +2212,37 @@ export default function App() {
                         return { left: pt.x * scaleX, top: pt.y * scaleY };
                       };
                       return (
-                        <Show when={pos() && alpha() > 0}>
-                          {() => {
-                            const p = pos()!;
-                            return (
-                              <div
-                                style={{
-                                  position: "absolute",
-                                  left: `${p.left - 6}px`,
-                                  top: `${p.top - 6}px`,
-                                  width: "12px",
-                                  height: "12px",
-                                  "border-radius": "50%",
-                                  background: "#fff",
-                                  border: "2px solid #000",
-                                  opacity: `${alpha()}`,
-                                  "pointer-events": "none",
-                                }}
-                              />
-                            );
-                          }}
+                        <Show when={pos() && alpha() > 0 ? pos() : null}>
+                          {(p) => (
+                            <div
+                              style={{
+                                position: "absolute",
+                                left: `${p()!.left - 6}px`,
+                                top: `${p()!.top - 6}px`,
+                                width: "12px",
+                                height: "12px",
+                                "border-radius": "50%",
+                                background: "#fff",
+                                border: "2px solid #000",
+                                opacity: `${alpha()}`,
+                                "pointer-events": "none",
+                              }}
+                            />
+                          )}
                         </Show>
                       );
                     }}
                   </For>
                 </Show>
               </div>
-              {/* Point cloud download indicator (3D Scene / 3D Object tabs) */}
+              {/* Point cloud chunk download indicator (3D Scene / 3D Object tabs) */}
               {(() => {
                 const active = () => {
                   if (viewTab() === "3d-scene" && scenePmLoading()) {
-                    return { label: "scene point cloud", progress: scenePmProgress() };
+                    return { loaded: scenePmChunksLoaded(), total: scenePmTotalChunks() };
                   }
                   if (viewTab() === "3d-object" && objectPmLoading()) {
-                    return { label: "object point cloud", progress: objectPmProgress() };
+                    return { loaded: objectPmChunksLoaded(), total: objectPmTotalChunks() };
                   }
                   return null;
                 };
@@ -2244,47 +2252,20 @@ export default function App() {
                       <div
                         style={{
                           position: "absolute",
-                          top: "50%",
-                          left: "50%",
-                          transform: "translate(-50%, -50%)",
-                          padding: "14px 22px",
-                          background: "rgba(0, 0, 0, 0.75)",
+                          right: "8px",
+                          bottom: "8px",
+                          padding: "4px 8px",
+                          background: "rgba(0, 0, 0, 0.65)",
                           color: "#e0e0e0",
-                          "border-radius": "6px",
-                          "font-size": "13px",
-                          "font-family": "inherit",
+                          "border-radius": "4px",
+                          font: "11px/1.4 ui-monospace, Consolas, monospace",
                           "pointer-events": "none",
-                          "min-width": "240px",
-                          "text-align": "center",
+                          "user-select": "none",
                         }}
                       >
-                        <div>
-                          Loading {s().label}
-                          {s().progress !== null
-                            ? `… ${Math.round(s().progress! * 100)}%`
-                            : "…"}
-                        </div>
-                        <Show when={s().progress !== null}>
-                          <div
-                            style={{
-                              "margin-top": "10px",
-                              width: "100%",
-                              height: "5px",
-                              background: "#333",
-                              "border-radius": "3px",
-                              overflow: "hidden",
-                            }}
-                          >
-                            <div
-                              style={{
-                                width: `${s().progress! * 100}%`,
-                                height: "100%",
-                                background: "#e94560",
-                                transition: "width 0.1s linear",
-                              }}
-                            />
-                          </div>
-                        </Show>
+                        {s().total !== null
+                          ? `chunks ${s().loaded ?? 0}/${s().total}`
+                          : "loading manifest…"}
                       </div>
                     )}
                   </Show>

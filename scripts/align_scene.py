@@ -15,8 +15,16 @@ import sys
 import os
 import json
 import argparse
+from pathlib import Path
 
 import numpy as np
+
+from _pointcloud_io import (
+    chunked_pointcloud_exists,
+    iter_chunked_pointcloud,
+    manifest_path,
+    chunk_path,
+)
 
 
 def main():
@@ -245,34 +253,36 @@ def main():
         json.dump(cameras, fp, indent=2)
     print(f"[align] wrote {cameras_path}")
 
-    # Transform scene_pointmap.npz if it exists.
-    # Points are stored in Three.js convention (x, -y, -z). We un-flip to
-    # OpenCV world, apply R_total/offset, then re-flip.
-    scene_pm_path = os.path.join(scene_dir, source, "scene_pointmap.npz")
-    if os.path.exists(scene_pm_path):
-        with np.load(scene_pm_path) as data:
-            pts = data["pts3d"].astype(np.float32)   # (M, 3) Three.js coords
-            rgb = data["rgb"]                         # (M, 3) uint8
-            conf = data["conf"]                       # (M,)
-
-        # Un-flip Three.js -> OpenCV: negate Y and Z
-        pts[:, 1] *= -1
-        pts[:, 2] *= -1
-
-        # Apply rotation
-        pts = np.ascontiguousarray((R_total @ pts.T).T)
-
-        # Re-flip OpenCV -> Three.js
-        pts[:, 1] *= -1
-        pts[:, 2] *= -1
-
-        np.savez_compressed(
-            scene_pm_path,
-            pts3d=pts.astype(np.float16),
-            rgb=rgb,
-            conf=conf,
-        )
-        print(f"[align] transformed {scene_pm_path} ({pts.shape[0]:,} points)")
+    # Transform the scene point cloud chunks in place.
+    # Points are stored in Three.js convention (x, -y, -z). For each chunk
+    # we un-flip to OpenCV world, apply R_total, then re-flip — keeping the
+    # working set bounded so we don't materialize a 100M-point array.
+    src_dir = Path(scene_dir) / source
+    if chunked_pointcloud_exists(src_dir, "scene_pointmap"):
+        total = 0
+        for ci, pts_in, rgb, conf in iter_chunked_pointcloud(src_dir, "scene_pointmap"):
+            pts = pts_in.astype(np.float32, copy=True)
+            pts[:, 1] *= -1
+            pts[:, 2] *= -1
+            pts = np.ascontiguousarray((R_total @ pts.T).T)
+            pts[:, 1] *= -1
+            pts[:, 2] *= -1
+            cp = chunk_path(src_dir, "scene_pointmap", ci)
+            np.savez_compressed(
+                cp,
+                pts3d=pts.astype(np.float16),
+                rgb=rgb,
+                conf=conf,
+            )
+            total += pts.shape[0]
+        # Refresh chunk byte sizes in the manifest so the client's progress
+        # bar stays accurate after the rewrite.
+        mp = manifest_path(src_dir, "scene_pointmap")
+        manifest = json.loads(mp.read_text())
+        for c in manifest["chunks"]:
+            c["bytes"] = int(os.path.getsize(src_dir / c["file"]))
+        mp.write_text(json.dumps(manifest))
+        print(f"[align] transformed {mp} ({total:,} points across {len(manifest['chunks'])} chunks)")
 
 
 if __name__ == "__main__":
