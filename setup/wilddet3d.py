@@ -16,6 +16,17 @@ Notes:
       `wilddet3d_alldata_all_prompt_v1.0.pt`.
     - Pinned torch / torchvision / numpy / pillow are filtered out of
       the requirements install so we keep the venv's CUDA torch build.
+    - `utils3d` in requirements.txt resolves to the wrong PyPI package
+      (Kalash Jain's, no `.pt`/`.np` submodules). WildDet3D's depth
+      backend calls `utils3d.pt.depth_map_to_point_map`, which is from
+      EasternJournalist's `utils3d` — git-only. We filter the PyPI name
+      out and install the git version separately.
+    - `vis4d==1.0.0` pulls in `bdd100k` and `scalabel`, which transitively
+      pin matplotlib 3.5.3 / Shapely 1.8 — neither has a Python 3.13
+      wheel and both fail to build from sdist. The wilddet3d inference
+      path doesn't touch any of those. We install vis4d with --no-deps
+      and add only the runtime libs from WildDet3D's HF demo
+      requirements (vetted by allenai for inference-only).
 
 Run after 00_venv.py:
 
@@ -25,6 +36,7 @@ Run after 00_venv.py:
 from __future__ import annotations
 
 import argparse
+import platform
 import sys
 from pathlib import Path
 
@@ -35,6 +47,32 @@ REPO_URL = "https://github.com/allenai/WildDet3D.git"
 COMMIT = "1768ffcd4c5e9bb1856d3f1a5b0b5e0498b89c97"
 HF_REPO = "allenai/WildDet3D"
 CKPT_NAME = "wilddet3d_alldata_all_prompt_v1.0.pt"
+
+UTILS3D_URL = "git+https://github.com/EasternJournalist/utils3d.git@94d1037aabbce32dea9c07a7c4849525817a1615"
+
+# vis4d runtime deps (from WildDet3D's demo/huggingface/requirements.txt)
+VIS4D_RUNTIME_DEPS = (
+    "lightning",
+    "jsonargparse[signatures]",
+    "pydantic>=2.0",
+    "cloudpickle",
+    "devtools",
+    "h5py",
+)
+
+# Submodule runtime deps (sam3 imports ftfy/regex/iopath/open_clip_torch;
+# lingbot_depth needs safetensors). Same set as the HF demo.
+SUBMODULE_DEPS = (
+    "ftfy",
+    "regex",
+    "iopath",
+    "open_clip_torch",
+    "safetensors",
+)
+
+# sam3.model.edt does `import triton`. The HF demo's Linux base ships triton
+# with torch; on Windows we need triton-windows (registers itself as `triton`).
+TRITON_WINDOWS = "triton-windows"
 
 
 def main() -> None:
@@ -51,10 +89,29 @@ def main() -> None:
 
     req = repo_dir / "requirements.txt"
     if req.exists():
-        print(f"[wilddet3d] installing {req.name} (skipping torch/torchvision/numpy/pillow pins)")
-        _lib.install_requirements_filtered(req)
+        print(f"[wilddet3d] installing {req.name} (skipping torch/torchvision/numpy/pillow/utils3d/vis4d)")
+        _lib.install_requirements_filtered(
+            req,
+            skip_names=("torch", "torchvision", "numpy", "pillow", "utils3d", "vis4d"),
+        )
     else:
         print(f"[wilddet3d] no requirements.txt at {req}; skipping pip install")
+
+    print("[wilddet3d] installing vis4d==1.0.0 with --no-deps (avoids broken bdd100k/scalabel chain)")
+    _lib.run_in_venv(["-m", "pip", "install", "--no-deps", "vis4d==1.0.0"])
+
+    print(f"[wilddet3d] installing vis4d runtime deps: {', '.join(VIS4D_RUNTIME_DEPS)}")
+    _lib.pip_install(*VIS4D_RUNTIME_DEPS)
+
+    print(f"[wilddet3d] installing sam3/lingbot_depth deps: {', '.join(SUBMODULE_DEPS)}")
+    _lib.pip_install(*SUBMODULE_DEPS)
+
+    if platform.system() == "Windows":
+        print(f"[wilddet3d] installing {TRITON_WINDOWS} (sam3 imports triton)")
+        _lib.pip_install(TRITON_WINDOWS)
+
+    print(f"[wilddet3d] installing utils3d from {UTILS3D_URL}")
+    _lib.pip_install(UTILS3D_URL)
 
     ckpt_dir = repo_dir / "ckpt"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
