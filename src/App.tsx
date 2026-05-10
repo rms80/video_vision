@@ -78,10 +78,10 @@ export default function App() {
     savedSceneSource && SCENE_PLUGINS_BY_ID[savedSceneSource] ? savedSceneSource : DEFAULT_SCENE_PLUGIN_ID,
   );
   let scenePollTimer: number | undefined;
-  type ViewTab = "source" | "depth" | "3d" | "3d-scene";
+  type ViewTab = "source" | "depth" | "3d" | "3d-scene" | "3d-object";
   const storedTab = localStorage.getItem("segviewer:viewTab") as ViewTab | null;
   const [viewTab, setViewTab] = createSignal<ViewTab>(
-    storedTab && ["source", "depth", "3d", "3d-scene"].includes(storedTab) ? storedTab : "source"
+    storedTab && ["source", "depth", "3d", "3d-scene", "3d-object"].includes(storedTab) ? storedTab : "source"
   );
   const [showSourceMask, setShowSourceMask] = createSignal(
     localStorage.getItem("segviewer:showSourceMask") !== "false"
@@ -137,11 +137,23 @@ export default function App() {
   const [boxSolverOptions, setBoxSolverOptions] =
     createSignal<Record<string, Record<string, boolean>>>(initialBoxSolverOptions);
   createEffect(() => localStorage.setItem("segviewer:boxSolverOptions", JSON.stringify(boxSolverOptions())));
-  const [reconstructRunning, setReconstructRunning] = createSignal(false);
-  const [reconstructMesh, setReconstructMesh] = createSignal<string | null>(null);
-  // Available .glb meshes for the current analysis (filenames like "000063.glb")
-  const [reconstructMeshes, setReconstructMeshes] = createSignal<string[]>([]);
-  const [selectedMesh, setSelectedMesh] = createSignal<string | null>(null);
+  // Per-object world-space point cloud (depth points filtered by per-frame
+  // tracking masks, fused across frames). Stored at
+  // <analysis>/object_pointmap/<source>.npz; both `running` and `ready`
+  // are scoped to (currentAnalysis, sceneSource).
+  const [objectPointmapRunning, setObjectPointmapRunning] = createSignal(false);
+  const [objectPointmapReady, setObjectPointmapReady] = createSignal(false);
+  // Scene-pointmap fetch status (driven by ThreeDepthViewer.onScenePointmapStatus).
+  // `progress` is null when Content-Length isn't reported; `pointCount` is
+  // null until the cloud has been parsed and added to the scene.
+  const [scenePmLoading, setScenePmLoading] = createSignal(false);
+  const [scenePmProgress, setScenePmProgress] = createSignal<number | null>(null);
+  const [scenePmPoints, setScenePmPoints] = createSignal<number | null>(null);
+  // Object-pointmap fetch status — same contract as scenePm*, scoped to the
+  // 3D (Object) tab.
+  const [objectPmLoading, setObjectPmLoading] = createSignal(false);
+  const [objectPmProgress, setObjectPmProgress] = createSignal<number | null>(null);
+  const [objectPmPoints, setObjectPmPoints] = createSignal<number | null>(null);
   const [pointmapView, setPointmapView] = createSignal(false);
   const [dataVersion, setDataVersion] = createSignal(0);
   const [showCameraPath, setShowCameraPath] = createSignal(true);
@@ -287,6 +299,20 @@ export default function App() {
       setViewTab("3d");
     }
   });
+  // Fall back from "3D (Object)" tab when no object cloud is available for the
+  // current (analysis, source) combo.
+  createEffect(() => {
+    if (viewTab() === "3d-object" && !objectPointmapReady()) setViewTab("3d");
+  });
+  // Refetch object-cloud state when the active scene source or analysis
+  // changes — each (analysis, source) pair has its own .npz file.
+  createEffect(() => {
+    const v = videoName();
+    const a = currentAnalysis();
+    const s = sceneSource();
+    if (v && a) refreshObjectPointmap(v, a, s);
+    else { setObjectPointmapReady(false); setObjectPointmapRunning(false); }
+  });
   // Save frame position, but skip saving during initial load (before video is ready)
   let videoReady = false;
   createEffect(() => {
@@ -386,9 +412,7 @@ export default function App() {
       // Try to load existing 3D-box result for the currently selected solver.
       // Switching solver later refetches via the solver-change effect.
       await refreshBoxResult(video, name, boxSolverId());
-      setReconstructMesh(null);
-      setSelectedMesh(null);
-      await refreshReconstructMeshes(video, name);
+      await refreshObjectPointmap(video, name, sceneSource());
       setStatus(`Loaded analysis: ${name}`);
     } catch (err: any) { setStatus(`Load error: ${err.message}`); }
   }
@@ -506,91 +530,93 @@ export default function App() {
     }
   }
 
-  function meshUrlFor(video: string, analysis: string, relPath: string): string {
+  function objectPointmapUrl(video: string, analysis: string, source: string): string {
     const stem = video.replace(/\.[^.]+$/, "");
-    // relPath is "<modelDir>/<file>.glb" — encode each segment separately so the slash survives.
-    const encoded = relPath.split("/").map(encodeURIComponent).join("/");
-    return `/analysis/${encodeURIComponent(stem)}/${encodeURIComponent(analysis)}/${encoded}`;
+    return `/analysis/${encodeURIComponent(stem)}/${encodeURIComponent(analysis)}/object_pointmap/${encodeURIComponent(source)}.npz`;
   }
 
-  async function refreshReconstructMeshes(video: string, analysis: string) {
+  async function refreshObjectPointmap(video: string, analysis: string, source: string) {
     try {
-      const r = await fetch(`/api/reconstruct3d-status?video=${encodeURIComponent(video)}&analysis=${encodeURIComponent(analysis)}`);
-      if (!r.ok) { setReconstructMeshes([]); return; }
+      const r = await fetch(
+        `/api/object-pointmap-status?video=${encodeURIComponent(video)}` +
+        `&analysis=${encodeURIComponent(analysis)}&source=${encodeURIComponent(source)}`,
+      );
+      if (!r.ok) { setObjectPointmapReady(false); setObjectPointmapRunning(false); return; }
       const s = await r.json();
-      const list: string[] = s.meshes ?? [];
-      setReconstructMeshes(list);
-      // If the current selection is gone, drop it; if no selection and list is non-empty, pick the latest.
-      if (selectedMesh() && !list.includes(selectedMesh()!)) setSelectedMesh(null);
-      if (!selectedMesh() && list.length > 0) setSelectedMesh(list[list.length - 1]);
-    } catch { setReconstructMeshes([]); }
+      setObjectPointmapReady(!!s.ready);
+      setObjectPointmapRunning(!!s.job?.running);
+    } catch {
+      setObjectPointmapReady(false);
+      setObjectPointmapRunning(false);
+    }
   }
 
-  async function runReconstruct() {
+  async function runObjectPointmap() {
     const video = videoName();
     const analysis = currentAnalysis();
+    const source = sceneSource();
     if (!video || !analysis || !trackData()) {
-      setStatus("Run tracking first before reconstructing 3D mesh");
+      setStatus("Run tracking first before building the object point cloud");
       return;
     }
-    const plugin = SCENE_PLUGINS_BY_ID[sceneSource()];
-    if (!plugin?.features?.pointmap) {
-      setStatus(`Source '${plugin?.label ?? sceneSource()}' has no per-frame pointmap; switch to Pi3 or MapAnything`);
+    if (depthFrames().length === 0) {
+      setStatus("No depth maps available — run a scene plugin first");
       return;
     }
-    setReconstructRunning(true);
-    setReconstructMesh(null);
-    const frame = currentFrame();
-    setStatus(`Reconstructing 3D mesh (Hunyuan3D-Omni) at frame ${frame}...`);
+    setObjectPointmapRunning(true);
+    setObjectPointmapReady(false);
+    setStatus("Building object point cloud (per-frame depth ∩ mask, fused)...");
     try {
-      const res = await fetch("/api/reconstruct3d", {
+      const res = await fetch("/api/object-pointmap", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ video, analysis, frame, source: sceneSource() }),
+        body: JSON.stringify({ video, analysis, source }),
       });
       const data = await res.json();
       if (data.error) {
-        setStatus(`Reconstruct failed: ${data.error}`);
-        setReconstructRunning(false);
+        setStatus(`Object cloud failed: ${data.error}`);
+        setObjectPointmapRunning(false);
         return;
       }
-      const usedFrame = data.state?.frame ?? frame;
-      if (usedFrame !== frame) {
-        setStatus(`Frame ${frame} has no pointmap; snapped to ${usedFrame}`);
-      }
-      const stem = video.replace(/\.[^.]+$/, "");
-      const meshPad = String(usedFrame).padStart(3, "0");
-      const meshUrl = `/analysis/${encodeURIComponent(stem)}/${encodeURIComponent(analysis)}/hunyuan_omni/${meshPad}.glb`;
       const poll = setInterval(async () => {
+        // Bail out if the user changed source mid-run; the new source's
+        // refresh will pick up its own state.
+        if (sceneSource() !== source || currentAnalysis() !== analysis) {
+          clearInterval(poll);
+          return;
+        }
         try {
-          const r = await fetch(`/api/reconstruct3d-status?video=${encodeURIComponent(video)}&analysis=${encodeURIComponent(analysis)}`);
+          const r = await fetch(
+            `/api/object-pointmap-status?video=${encodeURIComponent(video)}` +
+            `&analysis=${encodeURIComponent(analysis)}&source=${encodeURIComponent(source)}`,
+          );
           if (!r.ok) return;
           const s = await r.json();
           if (s.job && !s.job.running) {
             clearInterval(poll);
-            setReconstructRunning(false);
+            setObjectPointmapRunning(false);
             if (s.job.error) {
-              setStatus(`Reconstruct failed: ${s.job.error}`);
+              setStatus(`Object cloud failed: ${s.job.error}`);
+              setObjectPointmapReady(false);
             } else {
-              setReconstructMesh(meshUrl);
+              setObjectPointmapReady(!!s.ready);
               const elapsed = ((s.job.finishedAt - s.job.startedAt) / 1000).toFixed(1);
-              setStatus(`Reconstruct done in ${elapsed}s -> ${meshUrl}`);
-              await refreshReconstructMeshes(video, analysis);
-              setSelectedMesh(`hunyuan_omni/${meshPad}.glb`);
+              setStatus(`Object cloud built in ${elapsed}s`);
+              setDataVersion((v) => v + 1);  // force viewer to refetch
             }
           }
         } catch {}
-      }, 3000);
+      }, 2000);
       setTimeout(() => {
         clearInterval(poll);
-        if (reconstructRunning()) {
-          setReconstructRunning(false);
-          setStatus("Reconstruct timed out");
+        if (objectPointmapRunning()) {
+          setObjectPointmapRunning(false);
+          setStatus("Object cloud timed out");
         }
-      }, 1200000);  // 20 min ceiling
+      }, 600000);
     } catch (err: any) {
-      setStatus(`Reconstruct error: ${err.message}`);
-      setReconstructRunning(false);
+      setStatus(`Object cloud error: ${err.message}`);
+      setObjectPointmapRunning(false);
     }
   }
 
@@ -617,9 +643,8 @@ export default function App() {
         setCurrentAnalysis(null);
         setTrackData(null);
         setBoxResult(null);
-        setReconstructMesh(null);
-        setReconstructMeshes([]);
-        setSelectedMesh(null);
+        setObjectPointmapRunning(false);
+        setObjectPointmapReady(false);
         setFloorPoints([]);
         setSettingFloor(false);
         setAnalyses([]);
@@ -653,9 +678,8 @@ export default function App() {
         setSeedPoint(null);
         setTrackData(null);
         setBoxResult(null);
-        setReconstructMesh(null);
-        setReconstructMeshes([]);
-        setSelectedMesh(null);
+        setObjectPointmapRunning(false);
+        setObjectPointmapReady(false);
         localStorage.removeItem("segviewer:analysis");
       }
       await refreshAnalyses(video);
@@ -677,9 +701,8 @@ export default function App() {
     setCurrentAnalysis(null);
     setTrackData(null);
     setBoxResult(null);
-    setReconstructMesh(null);
-    setReconstructMeshes([]);
-    setSelectedMesh(null);
+    setObjectPointmapRunning(false);
+    setObjectPointmapReady(false);
     setFloorPoints([]);
     setSettingFloor(false);
     setStatus(`Loaded: ${filename}`);
@@ -1745,88 +1768,42 @@ export default function App() {
               })()}
             </div>
 
-            {/* Mesh Reconstruction */}
+            {/* Object Point Cloud */}
             <div style={{ padding: "12px 16px" }}>
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
-                Mesh Reconstruction
+                Object Point Cloud
               </div>
               {(() => {
-                const plugin = () => SCENE_PLUGINS_BY_ID[sceneSource()];
-                const hasPointmap = () => !!plugin()?.features?.pointmap;
-                const enabled = () => !!trackData() && hasPointmap() && !reconstructRunning();
+                const enabled = () =>
+                  !!trackData() && depthFrames().length > 0 && !objectPointmapRunning();
                 const tip = () => {
                   if (!trackData()) return "Run tracking first";
-                  if (!hasPointmap()) return `Source '${plugin()?.label ?? sceneSource()}' has no per-frame pointmap; switch to Pi3 or MapAnything`;
-                  if (reconstructMesh()) return reconstructMesh() ?? undefined;
-                  return `Reconstruct frame ${currentFrame()} with Hunyuan3D-Omni (~3-5 min on 12GB VRAM)`;
+                  if (depthFrames().length === 0) {
+                    return `Source '${SCENE_PLUGINS_BY_ID[sceneSource()]?.label ?? sceneSource()}' has no depth — run a scene plugin first`;
+                  }
+                  if (objectPointmapReady()) {
+                    return "Object point cloud is ready — open the 3D (Object) tab. Click to rebuild from current depth + masks.";
+                  }
+                  return "For each frame, take the depth points inside the tracking mask, lift to world space, and fuse across frames into a single point cloud.";
                 };
                 return (
                   <button
                     style={{
-                      ...accentBtnStyle(enabled(), !!reconstructMesh()),
+                      ...accentBtnStyle(enabled(), objectPointmapReady()),
                       width: "100%",
                     }}
                     title={tip()}
-                    onClick={runReconstruct}
+                    onClick={runObjectPointmap}
                     disabled={!enabled()}
                   >
-                    {reconstructRunning()
-                      ? "Reconstructing..."
-                      : reconstructMesh()
-                        ? `Reconstructed frame ${currentFrame()}`
-                        : `Reconstruct 3D (frame ${currentFrame()})`}
+                    {objectPointmapRunning()
+                      ? "Building..."
+                      : objectPointmapReady()
+                        ? "Object Cloud Ready"
+                        : "Build Object Cloud"}
                   </button>
                 );
               })()}
-              <Show when={reconstructMeshes().length > 0}>
-                <div style={{ display: "flex", gap: "4px", "margin-top": "6px" }}>
-                  <select
-                    value={selectedMesh() ?? ""}
-                    onChange={(e) => setSelectedMesh(e.currentTarget.value || null)}
-                    title="Pick which reconstructed mesh to display in the 3D view. Each Reconstruct 3D run produces a .glb keyed by the frame it was reconstructed from; older runs stay listed so you can compare different frames or re-runs."
-                    style={{
-                      flex: "1",
-                      padding: "5px 8px",
-                      background: "#0a0e1a",
-                      border: "1px solid #0f3460",
-                      color: "#e0e0e0",
-                      "border-radius": "3px",
-                      "font-size": "12px",
-                      "font-family": "inherit",
-                      "min-width": "0",
-                      cursor: "pointer",
-                    }}
-                  >
-                    <For each={reconstructMeshes()}>
-                      {(p) => <option value={p}>{p}</option>}
-                    </For>
-                  </select>
-                  {(() => {
-                    const v = videoName();
-                    const a = currentAnalysis();
-                    const m = selectedMesh();
-                    const href = v && a && m ? meshUrlFor(v, a, m) : "#";
-                    const downloadName = m ? m.split("/").pop() ?? m : "";
-                    return (
-                      <a
-                        href={href}
-                        download={downloadName}
-                        style={{
-                          ...accentBtnStyle(!!m),
-                          padding: "5px 10px",
-                          "text-decoration": "none",
-                          display: "inline-flex",
-                          "align-items": "center",
-                          ...(m ? {} : { "pointer-events": "none", opacity: "0.5" }),
-                        }}
-                        title={m ? `Download ${m}` : "No mesh selected"}
-                      >
-                        Download
-                      </a>
-                    );
-                  })()}
-                </div>
-              </Show>
             </div>
           </div>
         </div>
@@ -1844,9 +1821,12 @@ export default function App() {
           {/* Tab bar */}
           <Show when={videoSrc()}>
             <div style={{ display: "flex", background: "#16213e", "border-bottom": "1px solid #0f3460" }}>
-              <For each={[["source", "Source"], ["depth", "Depth"], ["3d", "3D (Per-Frame)"], ["3d-scene", "3D (Scene)"]] as [ViewTab, string][]}>
+              <For each={[["source", "Source"], ["depth", "Depth"], ["3d", "3D (Per-Frame)"], ["3d-scene", "3D (Scene)"], ["3d-object", "3D (Object)"]] as [ViewTab, string][]}>
                 {([id, label]) => (
-                  <Show when={id !== "3d-scene" || !!SCENE_PLUGINS_BY_ID[sceneSource()]?.features?.scenePointmap}>
+                  <Show when={
+                    (id !== "3d-scene" || !!SCENE_PLUGINS_BY_ID[sceneSource()]?.features?.scenePointmap)
+                    && (id !== "3d-object" || objectPointmapReady())
+                  }>
                     <button
                       onClick={() => setViewTab(id)}
                       style={{
@@ -1897,7 +1877,7 @@ export default function App() {
                   );
                 })()}
               </Show>
-              <Show when={viewTab() === "3d" || viewTab() === "3d-scene"}>
+              <Show when={viewTab() === "3d" || viewTab() === "3d-scene" || viewTab() === "3d-object"}>
                 {(() => {
                   const tbtn = (active: boolean, disabled = false) => ({
                     padding: "3px 8px",
@@ -2040,16 +2020,32 @@ export default function App() {
                 depthFrames={depthFrames()}
                 depthStem={depthStem()}
                 cameras={cameras()}
-                visible={viewTab() === "3d" || viewTab() === "3d-scene"}
+                visible={viewTab() === "3d" || viewTab() === "3d-scene" || viewTab() === "3d-object"}
                 boxResult={boxResult()}
                 boxSolverId={boxSolverId()}
                 sceneSource={sceneSource()}
                 usePointmap={pointmapView()}
                 scenePointmapMode={viewTab() === "3d-scene"}
+                objectPointmapMode={viewTab() === "3d-object"}
+                objectPointmapUrl={(() => {
+                  const v = videoName();
+                  const a = currentAnalysis();
+                  return v && a ? objectPointmapUrl(v, a, sceneSource()) : null;
+                })()}
                 dataVersion={dataVersion()}
                 showCameraPath={showCameraPath()}
                 downsample={meshSubsample()}
                 onReady={(actions) => { threeViewerActions = actions; }}
+                onScenePointmapStatus={(s) => {
+                  setScenePmLoading(s.loading);
+                  setScenePmProgress(s.progress);
+                  setScenePmPoints(s.pointCount);
+                }}
+                onObjectPointmapStatus={(s) => {
+                  setObjectPmLoading(s.loading);
+                  setObjectPmProgress(s.progress);
+                  setObjectPmPoints(s.pointCount);
+                }}
               />
               {/* Source video view */}
               <div
@@ -2231,6 +2227,69 @@ export default function App() {
                   </For>
                 </Show>
               </div>
+              {/* Point cloud download indicator (3D Scene / 3D Object tabs) */}
+              {(() => {
+                const active = () => {
+                  if (viewTab() === "3d-scene" && scenePmLoading()) {
+                    return { label: "scene point cloud", progress: scenePmProgress() };
+                  }
+                  if (viewTab() === "3d-object" && objectPmLoading()) {
+                    return { label: "object point cloud", progress: objectPmProgress() };
+                  }
+                  return null;
+                };
+                return (
+                  <Show when={active()}>
+                    {(s) => (
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: "50%",
+                          left: "50%",
+                          transform: "translate(-50%, -50%)",
+                          padding: "14px 22px",
+                          background: "rgba(0, 0, 0, 0.75)",
+                          color: "#e0e0e0",
+                          "border-radius": "6px",
+                          "font-size": "13px",
+                          "font-family": "inherit",
+                          "pointer-events": "none",
+                          "min-width": "240px",
+                          "text-align": "center",
+                        }}
+                      >
+                        <div>
+                          Loading {s().label}
+                          {s().progress !== null
+                            ? `… ${Math.round(s().progress! * 100)}%`
+                            : "…"}
+                        </div>
+                        <Show when={s().progress !== null}>
+                          <div
+                            style={{
+                              "margin-top": "10px",
+                              width: "100%",
+                              height: "5px",
+                              background: "#333",
+                              "border-radius": "3px",
+                              overflow: "hidden",
+                            }}
+                          >
+                            <div
+                              style={{
+                                width: `${s().progress! * 100}%`,
+                                height: "100%",
+                                background: "#e94560",
+                                transition: "width 0.1s linear",
+                              }}
+                            />
+                          </div>
+                        </Show>
+                      </div>
+                    )}
+                  </Show>
+                );
+              })()}
               {/* Drop overlay when dragging over video */}
               <Show when={dragOver()}>
                 <div
@@ -2288,6 +2347,12 @@ export default function App() {
                     }
                     return (
                       <>
+                        <Show when={tab === "3d-scene" && scenePmPoints() !== null}>
+                          <span>Points: {(scenePmPoints()! / 1_000_000).toFixed(2)}m</span>
+                        </Show>
+                        <Show when={tab === "3d-object" && objectPmPoints() !== null}>
+                          <span>Points: {(objectPmPoints()! / 1_000_000).toFixed(2)}m</span>
+                        </Show>
                         <span>Resolution: {size ? `${size.w}x${size.h}` : "—"}</span>
                         <Show when={kfCount !== null}>
                           <span>Keyframes: {kfCount}</span>

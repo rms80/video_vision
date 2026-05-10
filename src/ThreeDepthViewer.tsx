@@ -45,8 +45,31 @@ export interface ThreeDepthViewerProps {
   sceneSource?: string;
   usePointmap?: boolean;
   scenePointmapMode?: boolean;
+  /** When true, render the per-object world-space cloud at objectPointmapUrl. */
+  objectPointmapMode?: boolean;
+  /** URL of the .npz produced by build_object_pointmap.py for the current analysis + source. */
+  objectPointmapUrl?: string | null;
   showCameraPath?: boolean;
   onReady?: (actions: { snapCamera: () => void; fitAll: () => void }) => void;
+  /**
+   * Status callback for the global scene_pointmap.npz fetch — fires while
+   * the cloud is downloading (with progress when Content-Length is known)
+   * and when the cloud is disposed. Used by the parent to drive the
+   * loading overlay and the point-count readout in the bottom bar.
+   *   progress: null when total size is unknown
+   *   pointCount: null until the cloud has been parsed and added to the scene
+   */
+  onScenePointmapStatus?: (state: {
+    loading: boolean;
+    progress: number | null;
+    pointCount: number | null;
+  }) => void;
+  /** Same contract as onScenePointmapStatus, for the per-object cloud fetch. */
+  onObjectPointmapStatus?: (state: {
+    loading: boolean;
+    progress: number | null;
+    pointCount: number | null;
+  }) => void;
 }
 
 interface CachedEntry {
@@ -76,6 +99,12 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
   // Scene-level pointmap (global reconstruction)
   let scenePointmapObj: THREE.Points | null = null;
   let scenePointmapLoading = false;
+
+  // Per-object cloud: same data layout as scene_pointmap.npz (pts3d/rgb/conf
+  // already in Three.js convention), built by build_object_pointmap.py from
+  // depth ∩ track-mask. The object-mode effect disposes on URL change.
+  let objectPointmapObj: THREE.Points | null = null;
+  let objectPointmapLoading = false;
 
   // Camera path visualization
   let cameraPathLine: THREE.Line | null = null;
@@ -665,8 +694,14 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
       scenePointmapObj.geometry.dispose();
       (scenePointmapObj.material as THREE.PointsMaterial).dispose();
       scene.remove(scenePointmapObj);
+      scenePointmapObj = null;
+      // Only emit the cleared status when we actually wiped a cloud — this
+      // path also runs as a no-op on cleanup, where firing would clobber a
+      // freshly-loaded count from a different analysis.
+      props.onScenePointmapStatus?.({ loading: false, progress: null, pointCount: null });
+    } else {
+      scenePointmapObj = null;
     }
-    scenePointmapObj = null;
   }
 
   async function loadScenePointmap() {
@@ -675,16 +710,45 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
     if (!plugin.features?.scenePointmap) return;
 
     scenePointmapLoading = true;
+    const emit = (s: { loading: boolean; progress: number | null; pointCount: number | null }) =>
+      props.onScenePointmapStatus?.(s);
+    emit({ loading: true, progress: 0, pointCount: null });
     try {
       const url = `/analysis/${props.depthStem}/_scene/${plugin.camerasDir}/scene_pointmap.npz`;
       const resp = await fetch(url);
-      if (!resp.ok) return;
-      const buf = await resp.arrayBuffer();
-      const arrays = await parseNpz(buf);
+      if (!resp.ok || !resp.body) {
+        emit({ loading: false, progress: null, pointCount: null });
+        return;
+      }
+      const totalStr = resp.headers.get("Content-Length");
+      const total = totalStr ? Number(totalStr) : 0;
+      const reader = resp.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        chunks.push(value);
+        received += value.length;
+        emit({
+          loading: true,
+          progress: total > 0 ? received / total : null,
+          pointCount: null,
+        });
+      }
+      const merged = new Uint8Array(received);
+      let pos = 0;
+      for (const c of chunks) { merged.set(c, pos); pos += c.length; }
+
+      const arrays = await parseNpz(merged.buffer);
       const pts3dArr = arrays["pts3d"];
       const rgbArr = arrays["rgb"];
       const confArr = arrays["conf"];
-      if (!pts3dArr || !rgbArr || !confArr) return;
+      if (!pts3dArr || !rgbArr || !confArr) {
+        emit({ loading: false, progress: null, pointCount: null });
+        return;
+      }
 
       const result = buildScenePointCloud(
         new Float32Array(pts3dArr.data),
@@ -692,7 +756,10 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
         new Float32Array(confArr.data),
       );
 
-      if (result.pointCount === 0) return;
+      if (result.pointCount === 0) {
+        emit({ loading: false, progress: null, pointCount: 0 });
+        return;
+      }
 
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute("position", new THREE.BufferAttribute(result.positions, 3));
@@ -711,9 +778,100 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
       scenePointmapObj = new THREE.Points(geometry, material);
       scene!.add(scenePointmapObj);
 
+      emit({ loading: false, progress: 1, pointCount: result.pointCount });
       fitCameraToScene();
     } finally {
       scenePointmapLoading = false;
+    }
+  }
+
+  function disposeObjectPointmap() {
+    if (objectPointmapObj && scene) {
+      objectPointmapObj.geometry.dispose();
+      (objectPointmapObj.material as THREE.PointsMaterial).dispose();
+      scene.remove(objectPointmapObj);
+      objectPointmapObj = null;
+      props.onObjectPointmapStatus?.({ loading: false, progress: null, pointCount: null });
+    } else {
+      objectPointmapObj = null;
+    }
+  }
+
+  async function loadObjectPointmap(url: string) {
+    if (!scene || objectPointmapLoading) return;
+    objectPointmapLoading = true;
+    const emit = (s: { loading: boolean; progress: number | null; pointCount: number | null }) =>
+      props.onObjectPointmapStatus?.(s);
+    emit({ loading: true, progress: 0, pointCount: null });
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok || !resp.body) {
+        emit({ loading: false, progress: null, pointCount: null });
+        return;
+      }
+      const totalStr = resp.headers.get("Content-Length");
+      const total = totalStr ? Number(totalStr) : 0;
+      const reader = resp.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        chunks.push(value);
+        received += value.length;
+        emit({
+          loading: true,
+          progress: total > 0 ? received / total : null,
+          pointCount: null,
+        });
+      }
+      const merged = new Uint8Array(received);
+      let pos = 0;
+      for (const c of chunks) { merged.set(c, pos); pos += c.length; }
+
+      const arrays = await parseNpz(merged.buffer);
+      const pts3dArr = arrays["pts3d"];
+      const rgbArr = arrays["rgb"];
+      const confArr = arrays["conf"];
+      if (!pts3dArr || !rgbArr || !confArr) {
+        emit({ loading: false, progress: null, pointCount: null });
+        return;
+      }
+
+      const result = buildScenePointCloud(
+        new Float32Array(pts3dArr.data),
+        new Uint8Array(rgbArr.data),
+        new Float32Array(confArr.data),
+      );
+      if (result.pointCount === 0) {
+        emit({ loading: false, progress: null, pointCount: 0 });
+        return;
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(result.positions, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(result.colors, 3));
+      geometry.computeBoundingBox();
+
+      const bbox = geometry.boundingBox!;
+      const extent = bbox.getSize(new THREE.Vector3());
+      // Object clouds are typically a small fraction of scene extent; bias the
+      // point size up slightly relative to scene_pointmap so single objects
+      // remain visible.
+      const pointSize = Math.max(extent.x, extent.y, extent.z) * 0.004;
+
+      const material = new THREE.PointsMaterial({
+        size: pointSize,
+        vertexColors: true,
+        sizeAttenuation: true,
+      });
+      objectPointmapObj = new THREE.Points(geometry, material);
+      scene!.add(objectPointmapObj);
+
+      emit({ loading: false, progress: 1, pointCount: result.pointCount });
+    } finally {
+      objectPointmapLoading = false;
     }
   }
 
@@ -721,6 +879,7 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
     disposeBoxes();
     disposeMeshes();
     disposeScenePointmap();
+    disposeObjectPointmap();
     disposeCameraPath();
   }
 
@@ -899,12 +1058,12 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
 
   // React to frame changes — update depth mesh and camera marker
   createEffect(on(
-    () => [props.currentFrame, props.visible, props.depthFrames, props.cameras, props.usePointmap, props.scenePointmapMode, props.dataVersion, props.downsample] as const,
+    () => [props.currentFrame, props.visible, props.depthFrames, props.cameras, props.usePointmap, props.scenePointmapMode, props.objectPointmapMode, props.dataVersion, props.downsample] as const,
     ([frame, visible, depthFrames, cameras]) => {
       if (!visible || !cameras) return;
       updateCameraMarker(frame);
-      // In scene pointmap mode, don't load per-frame meshes
-      if (props.scenePointmapMode) return;
+      // In scene / object pointmap modes, don't load per-frame meshes
+      if (props.scenePointmapMode || props.objectPointmapMode) return;
       if (!depthFrames.length) return;
       const depthIdx = nearestDepthFrame(frame);
       if (depthIdx == null || depthIdx === currentShownFrame) return;
@@ -1007,6 +1166,52 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
         if (boxesGroup) {
           boxesGroup.visible = true;
           currentBoxFrame = null;  // force re-evaluation
+          updateBoxFrame(props.currentFrame);
+        }
+        const showPath = props.showCameraPath !== false;
+        if (cameraPathLine) cameraPathLine.visible = showPath;
+        if (cameraMarker) cameraMarker.visible = showPath;
+        for (const f of cameraFrustums) f.visible = showPath;
+      }
+    },
+  ));
+
+  // Object pointmap mode — load/dispose the per-object world cloud
+  let lastObjectMode: boolean | undefined = undefined;
+  let lastObjectUrl: string | null | undefined = undefined;
+  let lastObjectDataVersion: number | undefined = undefined;
+  createEffect(on(
+    () => [props.objectPointmapMode, props.visible, props.objectPointmapUrl, props.dataVersion] as const,
+    ([objectMode, visible, url, dataVersion]) => {
+      const changed = objectMode !== lastObjectMode;
+      const urlChanged = url !== lastObjectUrl;
+      const dataChanged = dataVersion !== lastObjectDataVersion;
+      lastObjectMode = objectMode;
+      lastObjectUrl = url;
+      lastObjectDataVersion = dataVersion;
+
+      if (objectMode && visible) {
+        // Hide per-frame meshes + boxes + cameras (mirror scene-mode)
+        if (meshGroup) meshGroup.visible = false;
+        if (boxesGroup) boxesGroup.visible = false;
+        if (cameraPathLine) cameraPathLine.visible = false;
+        if (cameraMarker) cameraMarker.visible = false;
+        for (const f of cameraFrustums) f.visible = false;
+        // Refetch if URL or data version changed (e.g. rebuild after re-track)
+        if ((urlChanged || dataChanged) && objectPointmapObj) {
+          disposeObjectPointmap();
+        }
+        if (!objectPointmapObj && url) loadObjectPointmap(url);
+      } else if (changed && !objectMode) {
+        // Leaving object mode — dispose cloud, restore per-frame view unless
+        // scene mode is also active (which keeps things hidden).
+        disposeObjectPointmap();
+        if (props.scenePointmapMode) return;
+        if (meshGroup) meshGroup.visible = true;
+        if (currentShownFrame != null) showOnlyMesh(currentShownFrame);
+        if (boxesGroup) {
+          boxesGroup.visible = true;
+          currentBoxFrame = null;
           updateBoxFrame(props.currentFrame);
         }
         const showPath = props.showCameraPath !== false;

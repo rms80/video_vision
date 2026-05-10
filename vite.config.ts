@@ -28,15 +28,6 @@ const VENV_PYTHON = path.resolve(
   ".venv",
   process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
 );
-// Hunyuan3D-Omni needs Python 3.10 + torch 2.5.1, so it lives in a sibling
-// venv at hunyuan3d-omni/.venv (set up via uv) — not the project venv.
-const HUNYUAN_VENV_PYTHON = path.resolve(
-  __dirname,
-  "..",
-  "hunyuan3d-omni",
-  ".venv",
-  process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
-);
 
 type SceneJobState = {
   video: string;
@@ -48,18 +39,41 @@ type SceneJobState = {
 };
 const sceneJobs = new Map<string, SceneJobState>(); // key: video filename
 
-type ReconstructJobState = {
+type ObjectPointmapJobState = {
   running: boolean;
-  frame: number;          // the frame actually used (post-snap)
-  requestedFrame: number; // what the client asked for
   source: string;
   startedAt: number;
   finishedAt?: number;
   error: string | null;
-  outPath?: string;  // absolute path to the .glb on disk
 };
-// key: `${video}::${analysis}` — one job per analysis
-const reconstructJobs = new Map<string, ReconstructJobState>();
+// key: `${video}::${analysis}::${source}` — one job per (analysis, source) pair
+const objectPointmapJobs = new Map<string, ObjectPointmapJobState>();
+
+const OBJECT_POINTMAP_DIR = "object_pointmap";
+
+function objectPointmapPath(video: string, analysis: string, source: string): string {
+  const stem = path.basename(video, path.extname(video));
+  return path.join(ANALYSIS_DIR, stem, analysis, OBJECT_POINTMAP_DIR, `${source}.npz`);
+}
+
+/**
+ * Wipe any object-point-cloud files that depended on the given source's
+ * cameras / depth (because that source was just re-prepared or aligned).
+ * Other sources' files in the same analysis dir are untouched.
+ */
+function deleteObjectPointmapsForSource(video: string, source: string) {
+  const stem = path.basename(video, path.extname(video));
+  const videoDir = path.join(ANALYSIS_DIR, stem);
+  if (!fs.existsSync(videoDir)) return;
+  for (const name of fs.readdirSync(videoDir)) {
+    if (name.startsWith("_")) continue;
+    const file = path.join(videoDir, name, OBJECT_POINTMAP_DIR, `${source}.npz`);
+    if (fs.existsSync(file)) {
+      fs.rmSync(file, { force: true });
+      console.log(`[object-pointmap] deleted ${file}`);
+    }
+  }
+}
 
 function sceneDir(video: string) {
   const stem = path.basename(video, path.extname(video));
@@ -309,6 +323,7 @@ function segViewerPlugin(): Plugin {
               });
             }
             deleteBoxSolverResults(video);
+            deleteObjectPointmapsForSource(video, plugin.id);
             if (plugin.cleanDir) {
               const d = path.join(sd, plugin.cleanDir);
               if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
@@ -400,6 +415,9 @@ function segViewerPlugin(): Plugin {
               try { worldupId = JSON.parse(fs.readFileSync(wuPath, "utf-8")).id ?? ""; } catch {}
             }
             const extraArgs = worldupId ? ["--worldup-id", worldupId] : [];
+            // Aligning rewrites this source's cameras.json + depth scale, which
+            // invalidates any prior per-object cloud built from it.
+            deleteObjectPointmapsForSource(video, plugin.id);
             // align_scene.py always wants --source=<camerasDir> so it knows where to read/write
             console.log(`[align] running on ${video} with ${points.length} floor points`);
             try {
@@ -551,8 +569,8 @@ function segViewerPlugin(): Plugin {
             if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
             if (fs.existsSync(analysisDir)) fs.rmSync(analysisDir, { recursive: true, force: true });
             sceneJobs.delete(name);
-            for (const key of Array.from(reconstructJobs.keys())) {
-              if (key.startsWith(`${name}::`)) reconstructJobs.delete(key);
+            for (const key of Array.from(objectPointmapJobs.keys())) {
+              if (key.startsWith(`${name}::`)) objectPointmapJobs.delete(key);
             }
             console.log(`[delete] removed video ${name} and ${analysisDir}`);
             res.end(JSON.stringify({ ok: true }));
@@ -678,13 +696,19 @@ function segViewerPlugin(): Plugin {
             const scriptPath = path.join(SCRIPTS_DIR, "track_object.py");
             // Re-tracking invalidates any prior 3D-box solver outputs for
             // this analysis (boxes are anchored to the previous track), so
-            // wipe both solver subdirs.
+            // wipe both solver subdirs. The per-object cloud is masked by
+            // the same track and is just as stale, so wipe it too.
             for (const solver of BOX_SOLVER_PLUGINS) {
               const solverDir = path.join(runDir, solver.subdir);
               if (fs.existsSync(solverDir)) {
                 fs.rmSync(solverDir, { recursive: true, force: true });
                 console.log(`[track] cleared ${solverDir}`);
               }
+            }
+            const objDir = path.join(runDir, OBJECT_POINTMAP_DIR);
+            if (fs.existsSync(objDir)) {
+              fs.rmSync(objDir, { recursive: true, force: true });
+              console.log(`[track] cleared ${objDir}`);
             }
             console.log(`[track] running ${scriptPath} on ${video} (${analysis})`);
             await new Promise<void>((resolve, reject) => {
@@ -762,7 +786,9 @@ function segViewerPlugin(): Plugin {
           const runDir = path.join(ANALYSIS_DIR, stem, name);
           try {
             if (fs.existsSync(runDir)) fs.rmSync(runDir, { recursive: true, force: true });
-            reconstructJobs.delete(`${video}::${name}`);
+            for (const key of Array.from(objectPointmapJobs.keys())) {
+              if (key.startsWith(`${video}::${name}::`)) objectPointmapJobs.delete(key);
+            }
             console.log(`[delete] removed analysis ${runDir}`);
             res.end(JSON.stringify({ ok: true }));
           } catch (err: any) {
@@ -905,120 +931,101 @@ function segViewerPlugin(): Plugin {
         res.end(JSON.stringify(result));
       });
 
-      // POST /api/reconstruct3d — run Hunyuan3D-Omni on segmented per-frame pointmap
-      // body: { video, analysis, frame, source }
-      // Spawns segviewer/scripts/run_hunyuan_omni.py in the hunyuan venv (separate
-      // Python 3.10 install). Output: <analysis>/hunyuan_omni/<NNNNNN>.glb.
-      server.middlewares.use("/api/reconstruct3d", (req, res, next) => {
+      // POST /api/object-pointmap — build a per-object world-space cloud by
+      // unprojecting the per-frame depth maps, masked by the per-frame SAM2
+      // tracks, into world coordinates and concatenating across frames.
+      // body: { video, analysis, source }
+      // Output: <analysis>/object_pointmap/<source>.npz
+      server.middlewares.use("/api/object-pointmap", (req, res, next) => {
         if (req.method !== "POST") return next();
         let body = "";
         req.on("data", (c: Buffer) => (body += c.toString()));
         req.on("end", () => {
           try {
-            const { video, analysis, frame, source } = JSON.parse(body);
-            if (!video || !analysis || typeof frame !== "number") {
+            const { video, analysis, source } = JSON.parse(body);
+            if (!video || !analysis) {
               res.statusCode = 400;
               res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: "Missing video, analysis, or frame" }));
+              res.end(JSON.stringify({ error: "Missing video or analysis" }));
               return;
             }
             const plugin = resolveSourcePlugin(source);
-            if (!plugin.features?.pointmap) {
-              res.statusCode = 400;
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({
-                error: `Source '${plugin.id}' has no per-frame pointmap; pick Pi3 or MapAnything`,
-              }));
-              return;
-            }
             const stem = path.basename(video, path.extname(video));
             const sd = sceneDir(video);
             const runDir = path.join(ANALYSIS_DIR, stem, analysis);
-            // Pointmaps are subsampled (e.g. Pi3 every 3rd frame); the user's
-            // current_frame may not have one. Snap to the nearest pointmap
-            // frame that *also* has a mask + a frame jpg.
-            const pmDir = path.join(sd, plugin.id, "pointmap");
-            const framesDir = path.join(sd, "frames");
-            const masksDir = path.join(runDir, "masks");
-            if (!fs.existsSync(pmDir)) {
+            const camerasPath = path.join(sd, plugin.camerasDir, "cameras.json");
+            if (!fs.existsSync(camerasPath)) {
               res.statusCode = 404;
               res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: `No pointmaps in ${pmDir} — re-run scene analysis` }));
+              res.end(JSON.stringify({
+                error: `cameras.json not found in ${plugin.camerasDir} — run the scene plugin first`,
+              }));
               return;
             }
-            const available = fs.readdirSync(pmDir)
-              .filter((f) => f.endsWith(".npz"))
-              .map((f) => parseInt(f.replace(".npz", ""), 10))
-              .filter((n) => Number.isFinite(n))
-              .filter((n) => {
-                const pad = String(n).padStart(6, "0");
-                return fs.existsSync(path.join(framesDir, `${pad}.jpg`))
-                    && fs.existsSync(path.join(masksDir, `${pad}.png`));
-              })
-              .sort((a, b) => a - b);
-            if (available.length === 0) {
+            const depthDir = path.join(sd, plugin.depthDir);
+            if (!fs.existsSync(depthDir)) {
               res.statusCode = 404;
               res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: "No frame has all of {pointmap, frame jpg, mask}" }));
+              res.end(JSON.stringify({
+                error: `No depth maps in ${plugin.depthDir} — run the scene plugin first`,
+              }));
               return;
             }
-            const snappedFrame = available.reduce(
-              (best, n) => Math.abs(n - frame) < Math.abs(best - frame) ? n : best,
-              available[0],
-            );
-            if (snappedFrame !== frame) {
-              console.log(`[hunyuan-omni] snapped frame ${frame} -> ${snappedFrame}`);
+            const trackPath = path.join(runDir, "track.json");
+            if (!fs.existsSync(trackPath)) {
+              res.statusCode = 404;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: "track.json not found — run tracking first" }));
+              return;
             }
-            const padded = String(snappedFrame).padStart(6, "0");
-            const meshPad = String(snappedFrame).padStart(3, "0");
 
-            const jobKey = `${video}::${analysis}`;
-            const existing = reconstructJobs.get(jobKey);
+            const jobKey = `${video}::${analysis}::${plugin.id}`;
+            const existing = objectPointmapJobs.get(jobKey);
             if (existing && existing.running) {
               res.statusCode = 409;
               res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: "Reconstruction already running", state: existing }));
+              res.end(JSON.stringify({ error: "Object point cloud already running", state: existing }));
               return;
             }
 
-            const outDir = path.join(runDir, "hunyuan_omni");
+            const outPath = objectPointmapPath(video, analysis, plugin.id);
+            const outDir = path.dirname(outPath);
             fs.mkdirSync(outDir, { recursive: true });
-            const outPath = path.join(outDir, `${meshPad}.glb`);
-            const logPath = path.join(outDir, "hunyuan_omni.log");
+            // Wipe any prior .npz for this source so /api/object-pointmap-status
+            // doesn't see a stale "ready" while the rebuild is in flight.
+            if (fs.existsSync(outPath)) fs.rmSync(outPath, { force: true });
+            const logPath = path.join(outDir, `${plugin.id}.log`);
 
-            const state: ReconstructJobState = {
+            const state: ObjectPointmapJobState = {
               running: true,
-              frame: snappedFrame,
-              requestedFrame: frame,
               source: plugin.id,
               startedAt: Date.now(),
               error: null,
-              outPath,
             };
-            reconstructJobs.set(jobKey, state);
+            objectPointmapJobs.set(jobKey, state);
 
-            const scriptPath = path.join(SCRIPTS_DIR, "run_hunyuan_omni.py");
+            const scriptPath = path.join(SCRIPTS_DIR, "build_object_pointmap.py");
             const pyArgs = [
               sd, runDir,
-              "--frame", String(snappedFrame),
               "--source", plugin.id,
+              "--depth-dir", plugin.depthDir,
               "--out", outPath,
             ];
-            console.log(`[hunyuan-omni] running on ${video} (${analysis}) frame=${snappedFrame} source=${plugin.id}`);
+            console.log(`[object-pointmap] running on ${video} (${analysis}) source=${plugin.id}`);
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify({ ok: true, state }));
 
-            runPython(scriptPath, pyArgs, logPath, HUNYUAN_VENV_PYTHON)
+            runPython(scriptPath, pyArgs, logPath)
               .then(() => {
                 state.running = false;
                 state.finishedAt = Date.now();
-                console.log(`[hunyuan-omni] done: ${outPath}`);
+                console.log(`[object-pointmap] done: ${outPath}`);
               })
               .catch((err) => {
                 state.running = false;
                 state.finishedAt = Date.now();
                 state.error = err?.message ?? String(err);
-                console.error(`[hunyuan-omni] failed: ${state.error}`);
+                console.error(`[object-pointmap] failed: ${state.error}`);
               });
           } catch (err: any) {
             res.statusCode = 500;
@@ -1028,37 +1035,25 @@ function segViewerPlugin(): Plugin {
         });
       });
 
-      // GET /api/reconstruct3d-status?video=<f>&analysis=<a> — poll job + artifact state
-      server.middlewares.use("/api/reconstruct3d-status", (req, res, next) => {
+      // GET /api/object-pointmap-status?video=<f>&analysis=<a>&source=<id>
+      // Returns { job, ready } where ready=true iff the .npz exists.
+      server.middlewares.use("/api/object-pointmap-status", (req, res, next) => {
         if (req.method !== "GET") return next();
         const url = new URL(req.url!, `http://${req.headers.host}`);
         const video = url.searchParams.get("video");
         const analysis = url.searchParams.get("analysis");
+        const sourceParam = url.searchParams.get("source");
         if (!video || !analysis) {
           res.statusCode = 400;
           res.setHeader("Content-Type", "application/json");
           res.end(JSON.stringify({ error: "Missing video or analysis" }));
           return;
         }
-        const job = reconstructJobs.get(`${video}::${analysis}`) ?? null;
-        const stem = path.basename(video, path.extname(video));
-        const analysisDir = path.join(ANALYSIS_DIR, stem, analysis);
-        // Walk all model subdirs (any direct child dir of the analysis that
-        // contains .glb files) — not hardcoded to "hunyuan_omni" so future
-        // model dirs show up automatically.
-        const meshes: string[] = [];
-        if (fs.existsSync(analysisDir)) {
-          for (const entry of fs.readdirSync(analysisDir, { withFileTypes: true })) {
-            if (!entry.isDirectory()) continue;
-            const subdir = path.join(analysisDir, entry.name);
-            for (const f of fs.readdirSync(subdir)) {
-              if (f.endsWith(".glb")) meshes.push(`${entry.name}/${f}`);
-            }
-          }
-          meshes.sort();
-        }
+        const plugin = resolveSourcePlugin(sourceParam);
+        const job = objectPointmapJobs.get(`${video}::${analysis}::${plugin.id}`) ?? null;
+        const ready = fs.existsSync(objectPointmapPath(video, analysis, plugin.id));
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ job, meshes }));
+        res.end(JSON.stringify({ job, ready, source: plugin.id }));
       });
 
       // GET /api/depth-frames?video=<filename>&source=<pluginId> — list available depth map frames
@@ -1098,6 +1093,7 @@ function segViewerPlugin(): Plugin {
           res.statusCode = 404;
           return res.end("Not found");
         }
+        const stat = fs.statSync(filepath);
         const ext = path.extname(filepath).toLowerCase();
         const mime: Record<string, string> = {
           ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -1105,6 +1101,9 @@ function segViewerPlugin(): Plugin {
           ".ply": "application/octet-stream",
         };
         res.setHeader("Content-Type", mime[ext] || "application/octet-stream");
+        // Set Content-Length so the browser can compute download progress
+        // (the scene/object pointmap loaders use it to drive the progress bar).
+        res.setHeader("Content-Length", String(stat.size));
         // Mask PNGs are immutable once written; other files (cameras.json, depth npz)
         // may be regenerated, so use ETag-based revalidation instead of long max-age.
         if (ext === ".png") {
