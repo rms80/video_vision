@@ -116,7 +116,17 @@ function runPython(script: string, args: string[], logPath: string, pythonExe: s
       try { fs.closeSync(fd); } catch {}
       fn();
     };
-    const py = spawn(pythonExe, [script, ...args], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
+    // Strip Python-related env vars inherited from the parent shell so the
+    // spawned interpreter resolves its standard library and DLLs against
+    // its own venv. A stale VIRTUAL_ENV / PYTHONHOME from the launching
+    // shell can otherwise cause STATUS_DLL_INIT_FAILED (0xC0000142) on
+    // Windows when the wrong pythonXY.dll is found first.
+    const cleanEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONIOENCODING: "utf-8" };
+    delete cleanEnv.VIRTUAL_ENV;
+    delete cleanEnv.PYTHONHOME;
+    delete cleanEnv.PYTHONPATH;
+    delete cleanEnv.PYTHONSTARTUP;
+    const py = spawn(pythonExe, [script, ...args], { stdio: ["ignore", "pipe", "pipe"], env: cleanEnv });
     py.stdout.on("data", (c: Buffer) => { try { fs.writeSync(fd, c); } catch {} });
     py.stderr.on("data", (c: Buffer) => { try { fs.writeSync(fd, c); } catch {} });
     py.on("close", (code) => finish(() => {
