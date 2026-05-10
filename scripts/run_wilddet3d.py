@@ -94,14 +94,19 @@ def box3d_to_corners(center, dims, R_obj):
 
     Args:
         center: (3,) center in world coordinates
-        dims: (3,) [W, L, H] dimensions
+        dims: (3,) [W, L, H] in WildDet3D's Omni3D order — width, length, height.
         R_obj: (3, 3) object rotation matrix in world frame
     Returns:
         corners: (8, 3) corner positions in world coordinates
+
+    Note: WildDet3D's local axes are permuted vs (W, L, H): local x = length,
+    local y = height, local z = width. Without this remap the rotation R_obj
+    spins the box around the wrong axes and a chair lays on its side. See
+    boxes3d_to_corners in WildDet3D's vis3d_glb.py.
     """
     w, l, h = dims
-    # Half-extents along object axes
-    dx, dy, dz = w / 2, l / 2, h / 2
+    # Half-extents along the object's *local* axes (x=L, y=H, z=W).
+    dx, dy, dz = l / 2, h / 2, w / 2
     # 8 corners in object-local frame
     local = np.array([
         [-dx, -dy, -dz],
