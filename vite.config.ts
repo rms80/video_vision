@@ -2,7 +2,7 @@ import { defineConfig, Plugin } from "vite";
 import solidPlugin from "vite-plugin-solid";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import ffmpegPath from "ffmpeg-static";
 import {
   SCENE_PLUGINS,
@@ -48,6 +48,77 @@ type ObjectPointmapJobState = {
 };
 // key: `${video}::${analysis}::${source}` — one job per (analysis, source) pair
 const objectPointmapJobs = new Map<string, ObjectPointmapJobState>();
+
+// Live child processes that support cancellation. The cancel endpoint
+// looks up the entry by key, sets `killed=true`, and tears down the
+// process tree; the spawning request's await rejects, and the killed
+// flag lets that handler downgrade the resulting non-zero exit into a
+// clean log line and a "cancelled" response instead of "error".
+type CancellableJob = { proc: ChildProcess; killed: boolean };
+const boxSolverJobs = new Map<string, CancellableJob>();   // `${video}::${analysis}::${solverId}`
+const detectJobs    = new Map<string, CancellableJob>();   // video filename
+const trackJobs     = new Map<string, CancellableJob>();   // `${video}::${analysis}`
+
+/**
+ * Kill a child process tree. On Windows the python interpreter forks
+ * worker subprocesses (CUDA, dataloader workers) and `proc.kill()` only
+ * targets the direct child, leaving the workers orphaned and continuing
+ * to chew GPU memory. `taskkill /F /T /PID` walks the tree.
+ *
+ * Resolves once taskkill (or proc.kill) has issued the termination —
+ * NOT once the child has finished exiting. Callers that need to know
+ * the child is gone should also await the spawn's close event.
+ */
+function killProcessTree(proc: ChildProcess, tag = ""): Promise<void> {
+  return new Promise((resolve) => {
+    if (!proc.pid) { console.warn(`[kill${tag}] no pid for child process`); resolve(); return; }
+    if (process.platform === "win32") {
+      const tk = spawn("taskkill", ["/F", "/T", "/PID", String(proc.pid)]);
+      let stderr = "";
+      let stdout = "";
+      tk.stdout.on("data", (c) => (stdout += c.toString()));
+      tk.stderr.on("data", (c) => (stderr += c.toString()));
+      tk.on("close", (code) => {
+        const msg = (stdout.trim() || stderr.trim()).replace(/\s+/g, " ");
+        if (code === 0) console.log(`[kill${tag}] taskkill pid=${proc.pid}: ${msg}`);
+        else console.warn(`[kill${tag}] taskkill pid=${proc.pid} exit=${code}: ${msg}`);
+        resolve();
+      });
+      tk.on("error", (err) => {
+        console.warn(`[kill${tag}] taskkill spawn error: ${err.message}; falling back to proc.kill()`);
+        try { proc.kill(); } catch {}
+        resolve();
+      });
+    } else {
+      try { proc.kill("SIGTERM"); } catch (e) { console.warn(`[kill${tag}] kill failed:`, e); }
+      resolve();
+    }
+  });
+}
+
+/**
+ * Cancel a registered job: mark killed, fire the tree-kill, await both
+ * the kill issuance and the child's actual exit before returning. Returns
+ * true if the child exited within `timeoutMs`, false otherwise.
+ */
+async function cancelJob(job: CancellableJob, tag: string, timeoutMs = 8000): Promise<boolean> {
+  job.killed = true;
+  await killProcessTree(job.proc, tag);
+  if (job.proc.exitCode !== null || job.proc.signalCode !== null) return true;
+  return await new Promise<boolean>((resolve) => {
+    let done = false;
+    const onClose = () => { if (!done) { done = true; resolve(true); } };
+    job.proc.once("close", onClose);
+    setTimeout(() => {
+      if (!done) {
+        done = true;
+        job.proc.off("close", onClose);
+        console.warn(`[kill${tag}] pid=${job.proc.pid} did not exit within ${timeoutMs}ms`);
+        resolve(false);
+      }
+    }, timeoutMs);
+  });
+}
 
 const OBJECT_POINTMAP_DIR = "object_pointmap";
 
@@ -145,7 +216,13 @@ function sourceFlagArgs(plugin: ScenePlugin): string[] {
   return plugin.sourceFlag ? ["--source", plugin.sourceFlag] : [];
 }
 
-function runPython(script: string, args: string[], logPath: string, pythonExe: string = VENV_PYTHON): Promise<void> {
+function runPython(
+  script: string,
+  args: string[],
+  logPath: string,
+  pythonExe: string = VENV_PYTHON,
+  onSpawn?: (proc: ChildProcess) => void,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const fd = fs.openSync(logPath, "a");
     fs.writeSync(fd, `\n===== ${new Date().toISOString()} ${pythonExe} ${script} ${args.join(" ")} =====\n`);
@@ -170,6 +247,7 @@ function runPython(script: string, args: string[], logPath: string, pythonExe: s
     delete cleanEnv.PYTHONPATH;
     delete cleanEnv.PYTHONSTARTUP;
     const py = spawn(pythonExe, [script, ...args], { stdio: ["ignore", "pipe", "pipe"], env: cleanEnv });
+    onSpawn?.(py);
     py.stdout.on("data", (c: Buffer) => { try { fs.writeSync(fd, c); } catch {} });
     py.stderr.on("data", (c: Buffer) => { try { fs.writeSync(fd, c); } catch {} });
     py.on("close", (code) => finish(() => {
@@ -605,9 +683,32 @@ function segViewerPlugin(): Plugin {
         next();
       });
 
-      // POST /api/detect — extract frame 0 and run SAM3 detection on it
-      // body: { video, x, y, label }
+      // POST   /api/detect — extract frame 0 and run SAM3 detection on it
+      //   body: { video, x, y, label }
+      // DELETE /api/detect?video= — kill the running detection for this video.
       server.middlewares.use("/api/detect", (req, res, next) => {
+        if (req.method === "DELETE") {
+          (async () => {
+            const url = new URL(req.url!, `http://${req.headers.host}`);
+            const video = url.searchParams.get("video");
+            res.setHeader("Content-Type", "application/json");
+            if (!video) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: "Missing video" }));
+              return;
+            }
+            const job = detectJobs.get(video);
+            if (!job) {
+              res.statusCode = 404;
+              res.end(JSON.stringify({ error: "No running detection for this video" }));
+              return;
+            }
+            console.log(`[detect] cancel requested for ${video}`);
+            const exited = await cancelJob(job, ":detect");
+            res.end(JSON.stringify({ ok: true, exited }));
+          })();
+          return;
+        }
         if (req.method !== "POST") return next();
         let body = "";
         req.on("data", (chunk: Buffer) => (body += chunk.toString()));
@@ -625,6 +726,12 @@ function segViewerPlugin(): Plugin {
               res.statusCode = 404;
               res.setHeader("Content-Type", "application/json");
               res.end(JSON.stringify({ error: "Video not found" }));
+              return;
+            }
+            if (detectJobs.has(video)) {
+              res.statusCode = 409;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: "Detection already running for this video" }));
               return;
             }
 
@@ -654,20 +761,29 @@ function segViewerPlugin(): Plugin {
               ff.on("error", reject);
             });
 
-            // 2. Run python detection script
+            // 2. Run python detection script (registered for cancellation).
             const scriptPath = path.join(SCRIPTS_DIR, "detect_object.py");
             console.log(`[detect] running ${scriptPath} on ${framePath} click=(${x},${y}) label="${label}"`);
-            await new Promise<void>((resolve, reject) => {
-              const py = spawn(VENV_PYTHON, [scriptPath, framePath, String(x), String(y), label, outputJsonPath]);
-              let stderr = "";
-              py.stderr.on("data", (c) => (stderr += c.toString()));
-              py.stdout.on("data", (c) => process.stdout.write(`[detect_object] ${c.toString()}`));
-              py.on("close", (code) => {
-                if (code === 0) resolve();
-                else reject(new Error(`python exit ${code}: ${stderr}`));
+            const job: CancellableJob = {
+              proc: spawn(VENV_PYTHON, [scriptPath, framePath, String(x), String(y), label, outputJsonPath]),
+              killed: false,
+            };
+            detectJobs.set(video, job);
+            try {
+              await new Promise<void>((resolve, reject) => {
+                let stderr = "";
+                job.proc.stderr?.on("data", (c) => (stderr += c.toString()));
+                job.proc.stdout?.on("data", (c) => process.stdout.write(`[detect_object] ${c.toString()}`));
+                job.proc.on("close", (code) => {
+                  if (code === 0) resolve();
+                  else if (job.killed) reject(new Error("__cancelled__"));
+                  else reject(new Error(`python exit ${code}: ${stderr}`));
+                });
+                job.proc.on("error", reject);
               });
-              py.on("error", reject);
-            });
+            } finally {
+              detectJobs.delete(video);
+            }
 
             // 3. Read and return result
             const result = JSON.parse(fs.readFileSync(outputJsonPath, "utf-8"));
@@ -675,17 +791,48 @@ function segViewerPlugin(): Plugin {
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify(result));
           } catch (err: any) {
-            console.error("[detect] error:", err);
-            res.statusCode = 500;
-            res.setHeader("Content-Type", "application/json");
-            res.end(JSON.stringify({ error: err.message ?? String(err) }));
+            const cancelled = err?.message === "__cancelled__";
+            if (cancelled) {
+              console.log(`[detect] cancelled`);
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ cancelled: true }));
+            } else {
+              console.error("[detect] error:", err);
+              res.statusCode = 500;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: err.message ?? String(err) }));
+            }
           }
         });
       });
 
-      // POST /api/track — run SAM2 video tracking seeded from a previous detection
-      // body: { video, analysis }  (analysis is the run folder name, e.g. "chair_1")
+      // POST   /api/track — run SAM2 video tracking seeded from a previous detection
+      //   body: { video, analysis }  (analysis is the run folder name, e.g. "chair_1")
+      // DELETE /api/track?video=&analysis= — kill the running tracker.
       server.middlewares.use("/api/track", (req, res, next) => {
+        if (req.method === "DELETE") {
+          (async () => {
+            const url = new URL(req.url!, `http://${req.headers.host}`);
+            const video = url.searchParams.get("video");
+            const analysis = url.searchParams.get("analysis");
+            res.setHeader("Content-Type", "application/json");
+            if (!video || !analysis) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: "Missing video or analysis" }));
+              return;
+            }
+            const job = trackJobs.get(`${video}::${analysis}`);
+            if (!job) {
+              res.statusCode = 404;
+              res.end(JSON.stringify({ error: "No running tracker for this analysis" }));
+              return;
+            }
+            console.log(`[track] cancel requested for ${video} (${analysis})`);
+            const exited = await cancelJob(job, ":track");
+            res.end(JSON.stringify({ ok: true, exited }));
+          })();
+          return;
+        }
         if (req.method !== "POST") return next();
         let body = "";
         req.on("data", (chunk: Buffer) => (body += chunk.toString()));
@@ -714,6 +861,13 @@ function segViewerPlugin(): Plugin {
               res.end(JSON.stringify({ error: "detect.json not found for this analysis" }));
               return;
             }
+            const jobKey = `${video}::${analysis}`;
+            if (trackJobs.has(jobKey)) {
+              res.statusCode = 409;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: "Tracker already running for this analysis" }));
+              return;
+            }
 
             const scriptPath = path.join(SCRIPTS_DIR, "track_object.py");
             // Re-tracking invalidates any prior 3D-box solver outputs for
@@ -733,27 +887,43 @@ function segViewerPlugin(): Plugin {
               console.log(`[track] cleared ${objDir}`);
             }
             console.log(`[track] running ${scriptPath} on ${video} (${analysis})`);
-            await new Promise<void>((resolve, reject) => {
-              const py = spawn(VENV_PYTHON, [scriptPath, videoPath, detectJsonPath, runDir]);
-              let stderr = "";
-              py.stderr.on("data", (c) => (stderr += c.toString()));
-              py.stdout.on("data", (c) => process.stdout.write(`[track_object] ${c.toString()}`));
-              py.on("close", (code) => {
-                if (code === 0) resolve();
-                else reject(new Error(`python exit ${code}: ${stderr}`));
+            const job: CancellableJob = {
+              proc: spawn(VENV_PYTHON, [scriptPath, videoPath, detectJsonPath, runDir]),
+              killed: false,
+            };
+            trackJobs.set(jobKey, job);
+            try {
+              await new Promise<void>((resolve, reject) => {
+                let stderr = "";
+                job.proc.stderr?.on("data", (c) => (stderr += c.toString()));
+                job.proc.stdout?.on("data", (c) => process.stdout.write(`[track_object] ${c.toString()}`));
+                job.proc.on("close", (code) => {
+                  if (code === 0) resolve();
+                  else if (job.killed) reject(new Error("__cancelled__"));
+                  else reject(new Error(`python exit ${code}: ${stderr}`));
+                });
+                job.proc.on("error", reject);
               });
-              py.on("error", reject);
-            });
+            } finally {
+              trackJobs.delete(jobKey);
+            }
 
             const trackJsonPath = path.join(runDir, "track.json");
             const result = JSON.parse(fs.readFileSync(trackJsonPath, "utf-8"));
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify(result));
           } catch (err: any) {
-            console.error("[track] error:", err);
-            res.statusCode = 500;
-            res.setHeader("Content-Type", "application/json");
-            res.end(JSON.stringify({ error: err.message ?? String(err) }));
+            const cancelled = err?.message === "__cancelled__";
+            if (cancelled) {
+              console.log(`[track] cancelled`);
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ cancelled: true }));
+            } else {
+              console.error("[track] error:", err);
+              res.statusCode = 500;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: err.message ?? String(err) }));
+            }
           }
         });
       });
@@ -837,11 +1007,38 @@ function segViewerPlugin(): Plugin {
         res.end(JSON.stringify(result));
       });
 
-      // POST /api/box-solver — run a 3D bbox lifting solver (Boxer or WildDet3D)
-      // body: { video, analysis, solverId, label, source, options }
-      // Result lands at <analysis>/<solver.subdir>/<solver.resultFile>; both
-      // solvers can co-exist for the same analysis run.
+      // POST   /api/box-solver — run a 3D bbox lifting solver (Boxer or WildDet3D)
+      //   body: { video, analysis, solverId, label, source, options }
+      //   Result lands at <analysis>/<solver.subdir>/<solver.resultFile>; both
+      //   solvers can co-exist for the same analysis run.
+      // DELETE /api/box-solver?video=&analysis=&solverId= — kill the running
+      //   solver process for this (video, analysis, solverId) tuple.
       server.middlewares.use("/api/box-solver", (req, res, next) => {
+        if (req.method === "DELETE") {
+          (async () => {
+            const url = new URL(req.url!, `http://${req.headers.host}`);
+            const video = url.searchParams.get("video");
+            const analysis = url.searchParams.get("analysis");
+            const solverId = url.searchParams.get("solverId");
+            res.setHeader("Content-Type", "application/json");
+            if (!video || !analysis || !solverId) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: "Missing video, analysis, or solverId" }));
+              return;
+            }
+            const jobKey = `${video}::${analysis}::${solverId}`;
+            const job = boxSolverJobs.get(jobKey);
+            if (!job) {
+              res.statusCode = 404;
+              res.end(JSON.stringify({ error: "No running solver for this analysis" }));
+              return;
+            }
+            console.log(`[${solverId}] cancel requested for ${video} (${analysis})`);
+            const exited = await cancelJob(job, `:${solverId}`);
+            res.end(JSON.stringify({ ok: true, exited }));
+          })();
+          return;
+        }
         if (req.method !== "POST") return next();
         let body = "";
         req.on("data", (chunk: Buffer) => (body += chunk.toString()));
@@ -880,6 +1077,15 @@ function segViewerPlugin(): Plugin {
               return;
             }
 
+            const jobKey = `${video}::${analysis}::${solverId}`;
+            const existing = boxSolverJobs.get(jobKey);
+            if (existing) {
+              res.statusCode = 409;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: "Solver already running for this analysis" }));
+              return;
+            }
+
             // Wipe this solver's output dir so polling doesn't see a stale result.
             // Other solvers' outputs are independent and untouched.
             const outDir = path.join(runDir, solver.subdir);
@@ -912,9 +1118,19 @@ function segViewerPlugin(): Plugin {
             res.end(JSON.stringify({ ok: true, status: "running" }));
 
             const logPath = path.join(outDir, solver.logFile);
-            runPython(scriptPath, pyArgs, logPath)
+            runPython(scriptPath, pyArgs, logPath, undefined, (proc) => {
+              boxSolverJobs.set(jobKey, { proc, killed: false });
+            })
               .then(() => console.log(`[${solver.id}] done: ${video} (${analysis})`))
-              .catch((err) => console.error(`[${solver.id}] failed: ${err}`));
+              .catch((err) => {
+                const job = boxSolverJobs.get(jobKey);
+                if (job?.killed) {
+                  console.log(`[${solver.id}] cancelled: ${video} (${analysis})`);
+                } else {
+                  console.error(`[${solver.id}] failed: ${err}`);
+                }
+              })
+              .finally(() => boxSolverJobs.delete(jobKey));
           } catch (err: any) {
             res.statusCode = 500;
             res.setHeader("Content-Type", "application/json");

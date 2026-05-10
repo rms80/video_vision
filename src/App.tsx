@@ -439,6 +439,7 @@ export default function App() {
         body: JSON.stringify({ video, analysis }),
       });
       const data = await res.json();
+      if (data.cancelled) { setStatus("Tracking cancelled"); return; }
       if (data.error) { setStatus(`Tracking failed: ${data.error}`); return; }
       setTrackData({ imageWidth: data.image_width, imageHeight: data.image_height, frames: data.frames });
       setStatus(`Tracked ${data.frame_count} frames with ${data.model}`);
@@ -446,6 +447,33 @@ export default function App() {
       setStatus(`Tracking error: ${err.message}`);
     } finally {
       setTracking(false);
+    }
+  }
+
+  async function cancelTrack() {
+    const video = videoName();
+    const analysis = currentAnalysis();
+    if (!video || !analysis) return;
+    // Flip the UI flag immediately — the server's DELETE waits for the
+    // tracker to actually exit (taskkill /T then close), which can take
+    // a beat on Windows when CUDA is mid-kernel.
+    setTracking(false);
+    setStatus("Cancelling tracking…");
+    try {
+      const r = await fetch(
+        `/api/track?video=${encodeURIComponent(video)}&analysis=${encodeURIComponent(analysis)}`,
+        { method: "DELETE" },
+      );
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setStatus(`Cancel failed: ${data.error ?? r.statusText}`);
+      } else if (data.exited === false) {
+        setStatus("Cancel sent but tracker did not exit cleanly — check log");
+      } else {
+        setStatus("Tracking cancelled");
+      }
+    } catch (e: any) {
+      setStatus(`Cancel error: ${e.message}`);
     }
   }
 
@@ -466,6 +494,49 @@ export default function App() {
     setBoxResult(null);
   }
 
+  // Poll/timeout handles for the in-flight solver run, captured so
+  // cancelBoxSolver() can clear them when the user aborts. (number on
+  // browser, NodeJS.Timeout in tests — just store as any.)
+  let boxPollInterval: ReturnType<typeof setInterval> | null = null;
+  let boxPollTimeout: ReturnType<typeof setTimeout> | null = null;
+  // Identifies the currently-running solver run so the poll loop can
+  // detect a cancel-and-restart and bail out cleanly.
+  let boxRunToken = 0;
+
+  function clearBoxPolling() {
+    if (boxPollInterval !== null) { clearInterval(boxPollInterval); boxPollInterval = null; }
+    if (boxPollTimeout !== null) { clearTimeout(boxPollTimeout); boxPollTimeout = null; }
+  }
+
+  async function cancelBoxSolver() {
+    const video = videoName();
+    const analysis = currentAnalysis();
+    const solverId = boxSolverId();
+    const solver = BOX_SOLVER_PLUGINS_BY_ID[solverId];
+    if (!video || !analysis || !solver) return;
+    boxRunToken++;          // invalidate the in-flight poll loop
+    clearBoxPolling();
+    setBoxRunning(false);
+    setStatus(`Cancelling ${solver.label}…`);
+    try {
+      const r = await fetch(
+        `/api/box-solver?video=${encodeURIComponent(video)}` +
+        `&analysis=${encodeURIComponent(analysis)}&solverId=${encodeURIComponent(solverId)}`,
+        { method: "DELETE" },
+      );
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setStatus(`${solver.label} cancel failed: ${data.error ?? r.statusText}`);
+      } else if (data.exited === false) {
+        setStatus(`${solver.label} cancel sent but process did not exit — check log`);
+      } else {
+        setStatus(`${solver.label} cancelled`);
+      }
+    } catch (e: any) {
+      setStatus(`${solver.label} cancel error: ${e.message}`);
+    }
+  }
+
   async function runBoxSolver() {
     const video = videoName();
     const analysis = currentAnalysis();
@@ -479,6 +550,8 @@ export default function App() {
       setStatus(`${solver.label} needs depth maps — run a scene plugin first`);
       return;
     }
+    const myToken = ++boxRunToken;
+    clearBoxPolling();
     setBoxRunning(true);
     setBoxResult(null);
     setStatus(`Running ${solver.label} 3D bounding box lifting...`);
@@ -501,11 +574,11 @@ export default function App() {
         return;
       }
       setStatus(`${solver.label} running — waiting for result...`);
-      const poll = setInterval(async () => {
-        // Bail out if the user switched solvers mid-run; the new solver's
-        // poller will own the running state.
-        if (boxSolverId() !== solverId) {
-          clearInterval(poll);
+      boxPollInterval = setInterval(async () => {
+        // Bail out if the user switched solvers, cancelled, or kicked off
+        // a new run; the owning run's token won't match.
+        if (boxRunToken !== myToken || boxSolverId() !== solverId) {
+          clearBoxPolling();
           return;
         }
         try {
@@ -513,8 +586,8 @@ export default function App() {
             `/api/box-solver-result?video=${encodeURIComponent(video)}` +
             `&name=${encodeURIComponent(analysis)}&solverId=${encodeURIComponent(solverId)}`,
           );
-          if (r.ok) {
-            clearInterval(poll);
+          if (r.ok && boxRunToken === myToken) {
+            clearBoxPolling();
             const result = await r.json();
             setBoxResult(result);
             setBoxRunning(false);
@@ -522,8 +595,9 @@ export default function App() {
           }
         } catch {}
       }, 2000);
-      setTimeout(() => {
-        clearInterval(poll);
+      boxPollTimeout = setTimeout(() => {
+        if (boxRunToken !== myToken) return;
+        clearBoxPolling();
         if (boxRunning()) {
           setBoxRunning(false);
           setStatus(`${solver.label} timed out`);
@@ -980,6 +1054,7 @@ export default function App() {
         body: JSON.stringify({ video: name, x: seed.x, y: seed.y, label }),
       });
       const data = await res.json();
+      if (data.cancelled) { setStatus("Detection cancelled"); return; }
       if (data.error) {
         setStatus(`Detection failed: ${data.error}`);
         return;
@@ -1000,6 +1075,26 @@ export default function App() {
       setStatus(`Detection error: ${err.message}`);
     } finally {
       setDetecting(false);
+    }
+  }
+
+  async function cancelDetect() {
+    const name = videoName();
+    if (!name) return;
+    setDetecting(false);
+    setStatus("Cancelling detection…");
+    try {
+      const r = await fetch(`/api/detect?video=${encodeURIComponent(name)}`, { method: "DELETE" });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setStatus(`Cancel failed: ${data.error ?? r.statusText}`);
+      } else if (data.exited === false) {
+        setStatus("Cancel sent but detector did not exit cleanly — check log");
+      } else {
+        setStatus("Detection cancelled");
+      }
+    } catch (e: any) {
+      setStatus(`Cancel error: ${e.message}`);
     }
   }
 
@@ -1265,6 +1360,15 @@ export default function App() {
     background: done ? "#2ecc71" : active ? "#e94560" : "#555",
     color: done ? "#000" : "#fff",
     "font-weight": "600",
+  });
+
+  /** Style for "Running (click to cancel)" buttons — clickable, orange. */
+  const cancellableRunningStyle = () => ({
+    ...btnStyle(true),
+    background: "#e67e22",
+    color: "#fff",
+    "font-weight": "600",
+    cursor: "pointer",
   });
 
   const deleteIconBtnStyle = (active = true) => ({
@@ -1644,32 +1748,40 @@ export default function App() {
                 {settingSeed() ? "Click on video..." : "Set Seed Location"}
               </button>
               <button
-                style={{
-                  ...accentBtnStyle(!!seedPoint() && !detecting(), !!detection()),
-                  width: "100%",
-                  "margin-top": "6px",
-                }}
-                title={detection()
+                style={detecting()
+                  ? { ...cancellableRunningStyle(), width: "100%", "margin-top": "6px" }
+                  : {
+                      ...accentBtnStyle(!!seedPoint() && !detecting(), !!detection()),
+                      width: "100%",
+                      "margin-top": "6px",
+                    }}
+                title={detecting()
+                  ? "Click to cancel SAM3 detection"
+                  : detection()
                   ? `Last detection: ${detection()!.label} (conf ${detection()!.confidence.toFixed(2)}) bbox=[${detection()!.bbox.join(", ")}]. Click to re-run.`
                   : "Run SAM3 on frame 0 using the seed point + Object Label. Produces a 2D bounding box and segmentation mask, and creates a new analysis folder ('<label>_<N>') that holds every downstream artifact."}
-                onClick={detectObject}
-                disabled={!seedPoint() || detecting()}
+                onClick={() => (detecting() ? cancelDetect() : detectObject())}
+                disabled={!detecting() && !seedPoint()}
               >
-                {detecting() ? "Detecting..." : "Detect Object In Frame 0 (SAM3)"}
+                {detecting() ? "Detecting (Click to Cancel)" : "Detect Object In Frame 0 (SAM3)"}
               </button>
               <button
-                style={{
-                  ...accentBtnStyle(!!currentAnalysis() && !tracking(), !!trackData()),
-                  width: "100%",
-                  "margin-top": "6px",
-                }}
-                title={trackData()
+                style={tracking()
+                  ? { ...cancellableRunningStyle(), width: "100%", "margin-top": "6px" }
+                  : {
+                      ...accentBtnStyle(!!currentAnalysis() && !tracking(), !!trackData()),
+                      width: "100%",
+                      "margin-top": "6px",
+                    }}
+                title={tracking()
+                  ? "Click to cancel SAM2 tracking"
+                  : trackData()
                   ? `Tracked across ${trackData()!.frames.length} frames. Click to re-run.`
                   : "Run SAM2 video tracking starting from the frame-0 detection mask. Produces a per-frame mask sequence (track.json) used by every downstream step — 3D box lifting, WildDet3D, and mesh reconstruction."}
-                onClick={trackThroughVideo}
-                disabled={!currentAnalysis() || tracking()}
+                onClick={() => (tracking() ? cancelTrack() : trackThroughVideo())}
+                disabled={!tracking() && !currentAnalysis()}
               >
-                {tracking() ? "Tracking..." : "Track Through Video (SAM2)"}
+                {tracking() ? "Tracking (Click to Cancel)" : "Track Through Video (SAM2)"}
               </button>
             </div>
 
@@ -1753,6 +1865,7 @@ export default function App() {
                   return true;
                 };
                 const tip = () => {
+                  if (boxRunning()) return `Click to cancel ${solver().label}`;
                   if (!trackData()) return "Run tracking first";
                   if (solver().requiresDepth && depthFrames().length === 0) {
                     return `${solver().label} needs depth maps — run a scene plugin first`;
@@ -1762,14 +1875,17 @@ export default function App() {
                   }
                   return `Run ${solver().label} 3D bounding box lifting on the tracked frames.`;
                 };
+                const style = boxRunning()
+                  ? { ...cancellableRunningStyle(), width: "100%" }
+                  : { ...accentBtnStyle(enabled(), ready()), width: "100%" };
                 return (
                   <button
-                    style={{ ...accentBtnStyle(enabled(), ready()), width: "100%" }}
+                    style={style}
                     title={tip()}
-                    onClick={runBoxSolver}
-                    disabled={!enabled()}
+                    onClick={() => (boxRunning() ? cancelBoxSolver() : runBoxSolver())}
+                    disabled={!boxRunning() && !enabled()}
                   >
-                    {boxRunning() ? "Running..." : "Compute Boxes"}
+                    {boxRunning() ? "Running (Click to Cancel)" : "Compute Boxes"}
                   </button>
                 );
               })()}
