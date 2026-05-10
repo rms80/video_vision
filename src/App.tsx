@@ -67,7 +67,7 @@ export default function App() {
   } | null>(null);
   const [sceneStatus, setSceneStatus] = createSignal<{
     artifacts: Record<string, boolean>;
-    job: { pluginId?: string; stage: string; running: boolean; error: string | null } | null;
+    job: { pluginId?: string; stage: string; running: boolean; error: string | null; cancelled?: boolean } | null;
   } | null>(null);
   // Which plugin (if any) we have locally initiated a prepare for. The
   // backend is authoritative via /api/scene/status.job.running, but we
@@ -943,6 +943,8 @@ export default function App() {
         if (wasRunning) {
           if (data.job?.error) {
             setStatus(`Scene prep failed: ${data.job.error}`);
+          } else if (data.job?.cancelled) {
+            // cancelScene() already set a status; don't overwrite with "complete".
           } else {
             setStatus("Scene prep complete.");
             const v = videoName();
@@ -1037,6 +1039,29 @@ export default function App() {
     } catch (err: any) {
       setStatus(`${plugin.label} error: ${err.message}`);
       setPreparingPluginId(null);
+    }
+  }
+
+  async function cancelScene() {
+    const v = videoName();
+    if (!v) return;
+    // Flip the UI flag immediately — the server's DELETE waits for the
+    // active python step to actually exit, which can take a beat on
+    // Windows when CUDA is mid-kernel.
+    setPreparingPluginId(null);
+    setStatus("Cancelling scene prep…");
+    try {
+      const r = await fetch(`/api/scene/prepare?video=${encodeURIComponent(v)}`, { method: "DELETE" });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setStatus(`Cancel failed: ${data.error ?? r.statusText}`);
+      } else if (data.exited === false) {
+        setStatus("Cancel sent but process did not exit — check log");
+      } else {
+        setStatus("Scene prep cancelled");
+      }
+    } catch (e: any) {
+      setStatus(`Cancel error: ${e.message}`);
     }
   }
 
@@ -1654,20 +1679,21 @@ export default function App() {
                 const [hovered, setHovered] = createSignal(false);
                 return (
                   <button
-                    style={{
-                      ...accentBtnStyle(!!videoSrc() && !isRunning(), isReady()),
-                      width: "100%",
-                    }}
+                    style={isRunning()
+                      ? { ...cancellableRunningStyle(), width: "100%" }
+                      : { ...accentBtnStyle(!!videoSrc(), isReady()), width: "100%" }}
                     onMouseEnter={() => setHovered(true)}
                     onMouseLeave={() => setHovered(false)}
-                    onClick={() => runScenePlugin(sceneSource())}
-                    disabled={!videoSrc() || isRunning()}
-                    title={isReady()
-                      ? "Outputs already exist for this plugin. Click to re-run from scratch (the plugin's output dir is wiped first). Status messages stream to analysis/<video>/_scene/<plugin>.log."
-                      : "Run the selected scene-reconstruction pipeline. Writes camera poses (cameras.json) + per-frame depth maps under analysis/<video>/_scene/<plugin>/. Long-running (seconds–minutes); progress streams into the log file."}
+                    onClick={() => (isRunning() ? cancelScene() : runScenePlugin(sceneSource()))}
+                    disabled={!videoSrc()}
+                    title={isRunning()
+                      ? "Click to cancel the running scene-prep pipeline"
+                      : isReady()
+                        ? "Outputs already exist for this plugin. Click to re-run from scratch (the plugin's output dir is wiped first). Status messages stream to analysis/<video>/_scene/<plugin>.log."
+                        : "Run the selected scene-reconstruction pipeline. Writes camera poses (cameras.json) + per-frame depth maps under analysis/<video>/_scene/<plugin>/. Long-running (seconds–minutes); progress streams into the log file."}
                   >
                     {isRunning()
-                      ? runningStageText()
+                      ? `${runningStageText()} (Click to Cancel)`
                       : isReady()
                         ? (hovered() ? "Re-Run Analysis" : "Analysis Ready")
                         : "Run Analysis"}

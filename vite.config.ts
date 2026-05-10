@@ -35,9 +35,15 @@ type SceneJobState = {
   stage: string;
   running: boolean;
   error: string | null;
+  cancelled?: boolean;
   startedAt: number;
 };
 const sceneJobs = new Map<string, SceneJobState>(); // key: video filename
+// Tracks the *currently executing* python subprocess for a scene-prep job so
+// the DELETE handler can kill mid-pipeline. The pipeline runs steps
+// sequentially (e.g. COLMAP then depth), so only one entry per video is live
+// at a time; the run loop swaps it out per step.
+const sceneActiveJobs = new Map<string, CancellableJob>(); // key: video filename
 
 type ObjectPointmapJobState = {
   running: boolean;
@@ -374,9 +380,34 @@ function segViewerPlugin(): Plugin {
         });
       });
 
-      // POST /api/scene/prepare — run the pipeline defined by a scene plugin
-      // body: { video, pluginId? }  (pluginId defaults to COLMAP for backcompat)
+      // POST   /api/scene/prepare — run the pipeline defined by a scene plugin
+      //   body: { video, pluginId? }  (pluginId defaults to COLMAP for backcompat)
+      // DELETE /api/scene/prepare?video= — kill the running pipeline mid-step.
+      //   The currently executing python subprocess is tree-killed; the run
+      //   loop sees `killed` and surfaces a `cancelled` flag on the job state.
       server.middlewares.use("/api/scene/prepare", (req, res, next) => {
+        if (req.method === "DELETE") {
+          (async () => {
+            const url = new URL(req.url!, `http://${req.headers.host}`);
+            const video = url.searchParams.get("video");
+            res.setHeader("Content-Type", "application/json");
+            if (!video) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: "Missing video" }));
+              return;
+            }
+            const job = sceneActiveJobs.get(video);
+            if (!job) {
+              res.statusCode = 404;
+              res.end(JSON.stringify({ error: "No running scene prep for this video" }));
+              return;
+            }
+            console.log(`[scene] cancel requested for ${video}`);
+            const exited = await cancelJob(job, ":scene");
+            res.end(JSON.stringify({ ok: true, exited }));
+          })();
+          return;
+        }
         if (req.method !== "POST") return next();
         let body = "";
         req.on("data", (c: Buffer) => (body += c.toString()));
@@ -461,14 +492,40 @@ function segViewerPlugin(): Plugin {
                     console.log(`[scene:vggt] targeting ${T} frames`);
                   }
                   console.log(`[scene:${plugin.id}] ${video}: ${step.stage} (${step.script})`);
-                  await runPython(path.join(SCRIPTS_DIR, step.script), args, logPath);
+                  // Already-cancelled before spawning the next step? Bail.
+                  if (sceneActiveJobs.get(video)?.killed) throw new Error("__cancelled__");
+                  let stepJob: CancellableJob | null = null;
+                  try {
+                    await runPython(
+                      path.join(SCRIPTS_DIR, step.script), args, logPath, undefined,
+                      (proc) => {
+                        stepJob = { proc, killed: false };
+                        sceneActiveJobs.set(video, stepJob);
+                      },
+                    );
+                  } catch (err) {
+                    // If cancelJob set killed=true on this step's job, surface
+                    // that to the outer catch as a cancellation, not an error.
+                    if (stepJob && (stepJob as CancellableJob).killed) throw new Error("__cancelled__");
+                    throw err;
+                  } finally {
+                    if (stepJob && sceneActiveJobs.get(video) === stepJob) {
+                      sceneActiveJobs.delete(video);
+                    }
+                  }
                 }
                 console.log(`[scene:${plugin.id}] ${video}: done`);
               } catch (err: any) {
-                state.error = err?.message ?? String(err);
-                console.error(`[scene:${plugin.id}] ${video}: ${state.error}`);
+                if (err?.message === "__cancelled__") {
+                  state.cancelled = true;
+                  console.log(`[scene:${plugin.id}] ${video}: cancelled`);
+                } else {
+                  state.error = err?.message ?? String(err);
+                  console.error(`[scene:${plugin.id}] ${video}: ${state.error}`);
+                }
               } finally {
                 state.running = false;
+                sceneActiveJobs.delete(video);
               }
             })();
           } catch (err: any) {
