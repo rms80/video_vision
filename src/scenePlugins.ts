@@ -89,11 +89,10 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     logFile: "prepare.log",
     readyMarkers: ["colmap/cameras.json", "depthanythingv2/meta.json"],
     pipeline: [
-      { stage: "frames", script: "extract_frames.py", args: ["$VIDEO", "$SCENE"] },
       { stage: "colmap", script: "run_colmap.py", args: ["$SCENE", "--max-size", "1920"] },
       { stage: "depth", script: "run_depth.py", args: ["$SCENE"] },
     ],
-    requiresFrames: false,
+    requiresFrames: true,
     subsampleDefault: 3,
     subsampleFlag: "--every",
     subsampleScript: "run_colmap.py",

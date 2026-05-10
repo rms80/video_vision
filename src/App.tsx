@@ -284,7 +284,7 @@ export default function App() {
   }
 
   async function uploadVideo(file: File) {
-    setStatus(`Uploading and re-encoding ${file.name} for smooth scrubbing...`);
+    setStatus(`Uploading ${file.name}: re-encoding and extracting frames...`);
     const res = await fetch("/api/upload", {
       method: "POST",
       headers: {
@@ -584,6 +584,79 @@ export default function App() {
     } catch (err: any) {
       setStatus(`Reconstruct error: ${err.message}`);
       setReconstructRunning(false);
+    }
+  }
+
+  async function deleteVideo(filename: string) {
+    if (!filename) return;
+    if (!window.confirm(`Delete "${filename}" and all its analyses? This cannot be undone.`)) return;
+    try {
+      const res = await fetch(`/api/videos?name=${encodeURIComponent(filename)}`, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setStatus(`Delete failed: ${data.error ?? res.statusText}`);
+        return;
+      }
+      // If the deleted video was loaded, clear video-related state.
+      if (videoName() === filename) {
+        videoReady = false;
+        setVideoSrc(null);
+        setVideoName(null);
+        setPlaying(false);
+        setCurrentTime(0);
+        setCurrentFrame(0);
+        setSeedPoint(null);
+        setDetection(null);
+        setCurrentAnalysis(null);
+        setTrackData(null);
+        setBoxerResult(null);
+        setWilddetResult(null);
+        setReconstructMesh(null);
+        setReconstructMeshes([]);
+        setSelectedMesh(null);
+        setFloorPoints([]);
+        setSettingFloor(false);
+        setAnalyses([]);
+        localStorage.removeItem("segviewer:video");
+        localStorage.removeItem("segviewer:analysis");
+      }
+      await refreshVideoList();
+      setStatus(`Deleted ${filename}`);
+    } catch (err: any) {
+      setStatus(`Delete error: ${err.message ?? err}`);
+    }
+  }
+
+  async function deleteAnalysis(name: string) {
+    const video = videoName();
+    if (!video || !name) return;
+    if (!window.confirm(`Delete analysis "${name}"? This cannot be undone.`)) return;
+    try {
+      const res = await fetch(
+        `/api/analyses?video=${encodeURIComponent(video)}&name=${encodeURIComponent(name)}`,
+        { method: "DELETE" },
+      );
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setStatus(`Delete failed: ${data.error ?? res.statusText}`);
+        return;
+      }
+      if (currentAnalysis() === name) {
+        setCurrentAnalysis(null);
+        setDetection(null);
+        setSeedPoint(null);
+        setTrackData(null);
+        setBoxerResult(null);
+        setWilddetResult(null);
+        setReconstructMesh(null);
+        setReconstructMeshes([]);
+        setSelectedMesh(null);
+        localStorage.removeItem("segviewer:analysis");
+      }
+      await refreshAnalyses(video);
+      setStatus(`Deleted analysis ${name}`);
+    } catch (err: any) {
+      setStatus(`Delete error: ${err.message ?? err}`);
     }
   }
 
@@ -1162,6 +1235,18 @@ export default function App() {
     "font-weight": "600",
   });
 
+  const deleteIconBtnStyle = (active = true) => ({
+    padding: "0 10px",
+    background: "transparent",
+    color: active ? "#e94560" : "#444",
+    border: `1px solid ${active ? "#0f3460" : "#222"}`,
+    "border-radius": "3px",
+    cursor: active ? "pointer" : "not-allowed",
+    "font-size": "16px",
+    "line-height": "1",
+    "font-family": "inherit",
+  });
+
   return (
     <div style={{ display: "flex", "flex-direction": "column", width: "100%", height: "100%" }}>
       {/* Top row: sidebar + viewport */}
@@ -1178,51 +1263,18 @@ export default function App() {
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
                 Video
               </div>
-              <select
-                value={videoName() ?? ""}
-                onChange={(e) => {
-                  const v = e.currentTarget.value;
-                  if (v) loadVideo(v);
-                }}
-                style={{
-                  width: "100%",
-                  padding: "6px 8px",
-                  background: "#0a0e1a",
-                  border: "1px solid #0f3460",
-                  color: "#e0e0e0",
-                  "border-radius": "3px",
-                  "font-size": "13px",
-                  "font-family": "inherit",
-                  cursor: "pointer",
-                }}
-              >
-                <option value="" disabled>
-                  {videos().length ? "Select a video..." : "No videos uploaded"}
-                </option>
-                <For each={videos()}>
-                  {(name) => <option value={name}>{name}</option>}
-                </For>
-              </select>
-              <Show when={videoSrc()}>
+              <div style={{ display: "flex", gap: "4px" }}>
                 <select
-                  value={currentAnalysis() ?? ""}
+                  value={videoName() ?? ""}
                   onChange={(e) => {
                     const v = e.currentTarget.value;
-                    if (v) {
-                      loadAnalysis(v);
-                    } else {
-                      setCurrentAnalysis(null);
-                      setDetection(null);
-                      setSeedPoint(null);
-                      setTrackData(null);
-                      localStorage.removeItem("segviewer:analysis");
-                      setStatus("New analysis");
-                    }
+                    if (v) loadVideo(v);
                   }}
+                  title="Select an uploaded video. Drop a new file anywhere on the page to upload — uploads are re-encoded for smooth scrubbing (half-second keyframes) and all frames are extracted up front, so 3D scene plugins can run without first running COLMAP."
                   style={{
-                    width: "100%",
+                    flex: "1",
+                    "min-width": "0",
                     padding: "6px 8px",
-                    "margin-top": "6px",
                     background: "#0a0e1a",
                     border: "1px solid #0f3460",
                     color: "#e0e0e0",
@@ -1232,11 +1284,67 @@ export default function App() {
                     cursor: "pointer",
                   }}
                 >
-                  <option value="">(create new)</option>
-                  <For each={analyses()}>
+                  <option value="" disabled>
+                    {videos().length ? "Select a video..." : "No videos uploaded"}
+                  </option>
+                  <For each={videos()}>
                     {(name) => <option value={name}>{name}</option>}
                   </For>
                 </select>
+                <button
+                  title="Delete this video and all its analyses"
+                  onClick={() => { const v = videoName(); if (v) deleteVideo(v); }}
+                  disabled={!videoName()}
+                  style={deleteIconBtnStyle(!!videoName())}
+                >
+                  ×
+                </button>
+              </div>
+              <Show when={videoSrc()}>
+                <div style={{ display: "flex", gap: "4px", "margin-top": "6px" }}>
+                  <select
+                    value={currentAnalysis() ?? ""}
+                    onChange={(e) => {
+                      const v = e.currentTarget.value;
+                      if (v) {
+                        loadAnalysis(v);
+                      } else {
+                        setCurrentAnalysis(null);
+                        setDetection(null);
+                        setSeedPoint(null);
+                        setTrackData(null);
+                        localStorage.removeItem("segviewer:analysis");
+                        setStatus("New analysis");
+                      }
+                    }}
+                    title="An analysis is a per-object detect+track run, named '<label>_<N>' (e.g. chair_1). Selecting one loads its frame-0 detection, mask, tracking results, and any 3D placement / mesh outputs. Choose '(create new)' to start fresh — a new analysis folder is created the next time you Detect."
+                    style={{
+                      flex: "1",
+                      "min-width": "0",
+                      padding: "6px 8px",
+                      background: "#0a0e1a",
+                      border: "1px solid #0f3460",
+                      color: "#e0e0e0",
+                      "border-radius": "3px",
+                      "font-size": "13px",
+                      "font-family": "inherit",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <option value="">(create new)</option>
+                    <For each={analyses()}>
+                      {(name) => <option value={name}>{name}</option>}
+                    </For>
+                  </select>
+                  <button
+                    title="Delete this analysis"
+                    onClick={() => { const a = currentAnalysis(); if (a) deleteAnalysis(a); }}
+                    disabled={!currentAnalysis()}
+                    style={deleteIconBtnStyle(!!currentAnalysis())}
+                  >
+                    ×
+                  </button>
+                </div>
               </Show>
             </div>
 
@@ -1291,6 +1399,9 @@ export default function App() {
                     }
                   }}
                   disabled={!settingFloor() && savedWorldUp().length === 0 && floorPoints().length === 0}
+                  title={settingFloor()
+                    ? "Finish picking world-up points (same as pressing Enter). Needs at least 3 points to save."
+                    : "Discard the current and any saved world-up points for this video so you can pick them again."}
                 >
                   {settingFloor() ? "Done" : "Clear"}
                 </button>
@@ -1318,6 +1429,7 @@ export default function App() {
                   const v = videoName();
                   if (v) refreshDepthFrames(v);
                 }}
+                title="Pick which scene-reconstruction method produces camera poses + per-frame depth. COLMAP is classical SfM (slow, robust, geometry-only). The neural plugins (CUT3R, VGGT, Pi3, MapAnything, WorldMirror, DA3) infer poses + depth in one feed-forward pass — usually faster and don't depend on COLMAP. Pi3 / MapAnything / WorldMirror also produce a global scene pointmap for the 3D (Scene) tab. WildDet3D additionally runs 3D object detection."
                 style={{
                   width: "100%",
                   padding: "6px 8px",
@@ -1336,7 +1448,10 @@ export default function App() {
                 </For>
               </select>
               <Show when={SCENE_PLUGINS_BY_ID[sceneSource()]?.subsampleDefault !== undefined}>
-                <div style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}>
+                <div
+                  style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
+                  title="Use every Nth extracted frame as input to this plugin. Higher N = faster + less VRAM but coarser camera trajectory and depth coverage. Each plugin's default reflects what the underlying script uses when no override is passed."
+                >
                   <label style={{ "font-size": "11px", color: "#aaa" }}>Subsample every</label>
                   <input
                     type="number"
@@ -1363,7 +1478,10 @@ export default function App() {
                 </div>
               </Show>
               <Show when={sceneSource() === "vggt"}>
-                <div style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}>
+                <div
+                  style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
+                  title="VGGT processes a fixed total number of anchor frames sampled evenly across the video (independent of subsample). Higher = better coverage / longer trajectory, but more VRAM."
+                >
                   <label style={{ "font-size": "11px", color: "#aaa" }}>Target frames</label>
                   <input
                     type="number"
@@ -1409,6 +1527,9 @@ export default function App() {
                     onMouseLeave={() => setHovered(false)}
                     onClick={() => runScenePlugin(sceneSource())}
                     disabled={!videoSrc() || isRunning()}
+                    title={isReady()
+                      ? "Outputs already exist for this plugin. Click to re-run from scratch (the plugin's output dir is wiped first). Status messages stream to analysis/<video>/_scene/<plugin>.log."
+                      : "Run the selected scene-reconstruction pipeline. Writes camera poses (cameras.json) + per-frame depth maps under analysis/<video>/_scene/<plugin>/. Long-running (seconds–minutes); progress streams into the log file."}
                   >
                     {isRunning()
                       ? runningStageText()
@@ -1430,6 +1551,7 @@ export default function App() {
                 }}
                 onClick={alignScene}
                 disabled={(floorPoints().length < 3 && savedWorldUp().length < 3) || aligning()}
+                title="Apply a similarity transform that puts the picked floor at y=0 and rescales depth to metric units. Edits the active plugin's cameras.json in place. Required before 3D box lifting and mesh reconstruction give meaningful real-world coordinates."
               >
                 {aligning() ? "Aligning..." : isAligned() ? "Aligned" : "Align Scene"}
               </button>
@@ -1440,7 +1562,10 @@ export default function App() {
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
                 Object Segmentation
               </div>
-              <div style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "8px" }}>
+              <div
+                style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "8px" }}
+                title="What you're looking for in the video (e.g. 'chair', 'red mug', 'person'). Used as the SAM3 text prompt to disambiguate which object the seed point refers to, and also names the analysis folder ('chair_1', 'chair_2', ...)."
+              >
                 <label style={{ "font-size": "11px", color: "#888", "white-space": "nowrap" }}>Object Label</label>
                 <input
                   type="text"
@@ -1467,7 +1592,9 @@ export default function App() {
                   width: "100%",
                   background: settingSeed() ? "#3498db" : seedPoint() ? "#2ecc71" : (videoSrc() ? "#e94560" : "#555"),
                 }}
-                title={seedPoint() ? `Seed: (${seedPoint()!.x}, ${seedPoint()!.y})` : "Click to set a seed point on frame 0"}
+                title={seedPoint()
+                  ? `Seed point set at (${seedPoint()!.x}, ${seedPoint()!.y}) on frame 0. Click to pick a new one.`
+                  : "Snap to frame 0 and arm the next click on the video as a seed point. The point + the Object Label tell SAM3 which instance to segment when multiple objects match the label."}
                 onClick={() => {
                   if (!videoSrc()) return;
                   if (videoEl) {
@@ -1491,7 +1618,9 @@ export default function App() {
                   width: "100%",
                   "margin-top": "6px",
                 }}
-                title={detection() ? `${detection()!.label} (conf ${detection()!.confidence.toFixed(2)}) [${detection()!.bbox.join(", ")}]` : undefined}
+                title={detection()
+                  ? `Last detection: ${detection()!.label} (conf ${detection()!.confidence.toFixed(2)}) bbox=[${detection()!.bbox.join(", ")}]. Click to re-run.`
+                  : "Run SAM3 on frame 0 using the seed point + Object Label. Produces a 2D bounding box and segmentation mask, and creates a new analysis folder ('<label>_<N>') that holds every downstream artifact."}
                 onClick={detectObject}
                 disabled={!seedPoint() || detecting()}
               >
@@ -1503,7 +1632,9 @@ export default function App() {
                   width: "100%",
                   "margin-top": "6px",
                 }}
-                title={trackData() ? `Tracked ${trackData()!.frames.length} frames` : undefined}
+                title={trackData()
+                  ? `Tracked across ${trackData()!.frames.length} frames. Click to re-run.`
+                  : "Run SAM2 video tracking starting from the frame-0 detection mask. Produces a per-frame mask sequence (track.json) used by every downstream step — 3D box lifting, WildDet3D, and mesh reconstruction."}
                 onClick={trackThroughVideo}
                 disabled={!currentAnalysis() || tracking()}
               >
@@ -1522,7 +1653,9 @@ export default function App() {
                     ...accentBtnStyle(!!trackData() && depthFrames().length > 0 && !boxerRunning(), !!boxerResult()),
                     flex: "1",
                   }}
-                  title={boxerResult()?.num_frames_with_boxes ? `${boxerResult()!.num_frames_with_boxes} frames with 3D boxes` : undefined}
+                  title={boxerResult()?.num_frames_with_boxes
+                    ? `Boxer produced 3D boxes on ${boxerResult()!.num_frames_with_boxes} frames. Click to re-run.`
+                    : "Lift the tracked 2D mask into a 3D oriented bounding box per frame using the depth maps from the active scene plugin. Requires depth, so run a scene plugin first. Use the Fuse toggle to combine all frames into one stable box."}
                   onClick={runBoxer}
                   disabled={!trackData() || depthFrames().length === 0 || boxerRunning()}
                 >
@@ -1538,6 +1671,7 @@ export default function App() {
                     padding: "4px 8px",
                   }}
                   onClick={() => setBoxerFuse(!boxerFuse())}
+                  title="When enabled, Boxer fuses all frames' masked point clouds into a single shared 3D box (more stable, slower). When off, it fits an independent box per frame (jittery but tracks pose changes)."
                 >
                   Fuse
                 </button>
@@ -1548,7 +1682,9 @@ export default function App() {
                     ...accentBtnStyle(!!trackData() && !wilddetRunning(), !!wilddetResult()),
                     flex: "1",
                   }}
-                  title={wilddetResult()?.num_frames_with_boxes ? `${wilddetResult()!.num_frames_with_boxes} frames with 3D boxes` : undefined}
+                  title={wilddetResult()?.num_frames_with_boxes
+                    ? `WildDet3D produced 3D boxes on ${wilddetResult()!.num_frames_with_boxes} frames. Click to re-run.`
+                    : "Run WildDet3D — a neural 3D detector — on the tracked frames. Unlike Boxer, it predicts 3D boxes directly from the image (and optionally K and/or depth maps via the K and D toggles) without needing a fully reconstructed scene."}
                   onClick={runWilddet}
                   disabled={!trackData() || wilddetRunning()}
                 >
@@ -1563,7 +1699,7 @@ export default function App() {
                     "font-size": "10px",
                     padding: "4px 8px",
                   }}
-                  title="Pass camera intrinsics to WildDet3D"
+                  title="Pass camera intrinsics (K) from the active scene plugin to WildDet3D as a prior. Improves 3D box scale/orientation when poses are well-calibrated; turn off to let the model estimate K itself."
                   onClick={() => setWilddetUseIntrinsics(!wilddetUseIntrinsics())}
                 >
                   K
@@ -1577,7 +1713,7 @@ export default function App() {
                     "font-size": "10px",
                     padding: "4px 8px",
                   }}
-                  title="Pass depth maps as input to WildDet3D"
+                  title="Pass per-frame depth maps from the active scene plugin to WildDet3D as a prior. Anchors box depth more reliably; turn off to let the model predict depth from the RGB alone."
                   onClick={() => setWilddetUseDepth(!wilddetUseDepth())}
                 >
                   D
@@ -1623,6 +1759,7 @@ export default function App() {
                   <select
                     value={selectedMesh() ?? ""}
                     onChange={(e) => setSelectedMesh(e.currentTarget.value || null)}
+                    title="Pick which reconstructed mesh to display in the 3D view. Each Reconstruct 3D run produces a .glb keyed by the frame it was reconstructed from; older runs stay listed so you can compare different frames or re-runs."
                     style={{
                       flex: "1",
                       padding: "5px 8px",

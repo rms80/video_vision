@@ -9,6 +9,7 @@ import {
   getScenePluginOrDefault,
   DEFAULT_SCENE_PLUGIN_ID,
   type ScenePlugin,
+  type PipelineStep,
 } from "./src/scenePlugins";
 
 const UPLOADS_DIR = path.resolve(__dirname, "uploads");
@@ -208,18 +209,36 @@ function segViewerPlugin(): Plugin {
           ]);
           let stderr = "";
           ff.stderr.on("data", (c: Buffer) => (stderr += c.toString()));
-          ff.on("close", (code) => {
+          ff.on("close", async (code) => {
             // Clean up raw file
             try { fs.unlinkSync(rawPath); } catch {}
-            if (code === 0) {
-              console.log(`[upload] re-encoded ${safeName} successfully`);
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ ok: true, filename: safeName }));
-            } else {
+            if (code !== 0) {
               console.error(`[upload] ffmpeg error: ${stderr}`);
               res.statusCode = 500;
               res.setHeader("Content-Type", "application/json");
               res.end(JSON.stringify({ error: `Re-encode failed: ${stderr.slice(-200)}` }));
+              return;
+            }
+            console.log(`[upload] re-encoded ${safeName} successfully`);
+            // Extract frames now so downstream plugins (CUT3R, VGGT, Pi3, ...)
+            // can run without first having to run COLMAP. Best-effort: if it
+            // fails, /api/scene/prepare will retry on demand.
+            const sd = sceneDir(safeName);
+            fs.mkdirSync(sd, { recursive: true });
+            console.log(`[upload] extracting frames for ${safeName}...`);
+            try {
+              await runPython(
+                path.join(SCRIPTS_DIR, "extract_frames.py"),
+                [filepath, sd],
+                path.join(sd, "extract_frames.log"),
+              );
+              console.log(`[upload] frames extracted for ${safeName}`);
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: true, filename: safeName }));
+            } catch (err: any) {
+              console.error(`[upload] extract_frames failed: ${err?.message ?? err}`);
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: true, filename: safeName, framesExtracted: false }));
             }
           });
           ff.on("error", (err) => {
@@ -273,11 +292,15 @@ function segViewerPlugin(): Plugin {
             }
             const sd = sceneDir(video);
             fs.mkdirSync(sd, { recursive: true });
-            if (plugin.requiresFrames && !fs.existsSync(path.join(sd, "frames.json"))) {
-              res.statusCode = 400;
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: "Extract frames first (run COLMAP pipeline)" }));
-              return;
+            // Frames are extracted at upload time; auto-bootstrap covers
+            // pre-existing uploads and any failed upload-time extraction.
+            const pipeline: PipelineStep[] = [...plugin.pipeline];
+            if (!fs.existsSync(path.join(sd, "frames.json"))) {
+              pipeline.unshift({
+                stage: "frames",
+                script: "extract_frames.py",
+                args: ["$VIDEO", "$SCENE"],
+              });
             }
             deleteBoxerResults(video);
             if (plugin.cleanDir) {
@@ -288,7 +311,7 @@ function segViewerPlugin(): Plugin {
             const state: SceneJobState = {
               video,
               pluginId: plugin.id,
-              stage: plugin.pipeline[0]?.stage ?? "running",
+              stage: pipeline[0]?.stage ?? "running",
               running: true,
               error: null,
               startedAt: Date.now(),
@@ -299,7 +322,7 @@ function segViewerPlugin(): Plugin {
 
             (async () => {
               try {
-                for (const step of plugin.pipeline) {
+                for (const step of pipeline) {
                   state.stage = step.stage;
                   const args = step.args.map((a) =>
                     a === "$VIDEO" ? videoPath : a === "$SCENE" ? sd : a,
@@ -484,12 +507,56 @@ function segViewerPlugin(): Plugin {
       });
 
       // GET /api/videos — list uploaded videos
-      server.middlewares.use("/api/videos", (_req, res) => {
-        const files = fs.existsSync(UPLOADS_DIR)
-          ? fs.readdirSync(UPLOADS_DIR).filter((f) => /\.(mp4|webm|mov|avi|mkv)$/i.test(f))
-          : [];
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ videos: files }));
+      // DELETE /api/videos?name=<filename> — remove the upload + its analysis dir
+      server.middlewares.use("/api/videos", (req, res, next) => {
+        if (req.method === "GET") {
+          const files = fs.existsSync(UPLOADS_DIR)
+            ? fs.readdirSync(UPLOADS_DIR).filter((f) => /\.(mp4|webm|mov|avi|mkv)$/i.test(f))
+            : [];
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ videos: files }));
+          return;
+        }
+        if (req.method === "DELETE") {
+          const url = new URL(req.url!, `http://${req.headers.host}`);
+          const name = url.searchParams.get("name");
+          res.setHeader("Content-Type", "application/json");
+          if (!name) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: "Missing name" }));
+            return;
+          }
+          // Reject path traversal attempts
+          if (name.includes("/") || name.includes("\\") || name.includes("..")) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: "Invalid name" }));
+            return;
+          }
+          const job = sceneJobs.get(name);
+          if (job && job.running) {
+            res.statusCode = 409;
+            res.end(JSON.stringify({ error: "Scene prep is running for this video" }));
+            return;
+          }
+          const filepath = path.join(UPLOADS_DIR, name);
+          const stem = path.basename(name, path.extname(name));
+          const analysisDir = path.join(ANALYSIS_DIR, stem);
+          try {
+            if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
+            if (fs.existsSync(analysisDir)) fs.rmSync(analysisDir, { recursive: true, force: true });
+            sceneJobs.delete(name);
+            for (const key of Array.from(reconstructJobs.keys())) {
+              if (key.startsWith(`${name}::`)) reconstructJobs.delete(key);
+            }
+            console.log(`[delete] removed video ${name} and ${analysisDir}`);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (err: any) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: err?.message ?? String(err) }));
+          }
+          return;
+        }
+        next();
       });
 
       // POST /api/detect — extract frame 0 and run SAM3 detection on it
@@ -647,18 +714,50 @@ function segViewerPlugin(): Plugin {
       });
 
       // GET /api/analyses?video=<filename> — list analysis runs for a video
+      // DELETE /api/analyses?video=<filename>&name=<analysis> — remove one run
       server.middlewares.use("/api/analyses", (req, res, next) => {
-        if (req.method !== "GET") return next();
-        const url = new URL(req.url!, `http://${req.headers.host}`);
-        const video = url.searchParams.get("video");
-        if (!video) { res.statusCode = 400; res.end(JSON.stringify({ error: "Missing video" })); return; }
-        const stem = path.basename(video, path.extname(video));
-        const videoDir = path.join(ANALYSIS_DIR, stem);
-        const analyses = fs.existsSync(videoDir)
-          ? fs.readdirSync(videoDir).filter((d) => !d.startsWith("_") && fs.statSync(path.join(videoDir, d)).isDirectory()).sort()
-          : [];
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ analyses }));
+        if (req.method === "GET") {
+          const url = new URL(req.url!, `http://${req.headers.host}`);
+          const video = url.searchParams.get("video");
+          if (!video) { res.statusCode = 400; res.end(JSON.stringify({ error: "Missing video" })); return; }
+          const stem = path.basename(video, path.extname(video));
+          const videoDir = path.join(ANALYSIS_DIR, stem);
+          const analyses = fs.existsSync(videoDir)
+            ? fs.readdirSync(videoDir).filter((d) => !d.startsWith("_") && fs.statSync(path.join(videoDir, d)).isDirectory()).sort()
+            : [];
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ analyses }));
+          return;
+        }
+        if (req.method === "DELETE") {
+          const url = new URL(req.url!, `http://${req.headers.host}`);
+          const video = url.searchParams.get("video");
+          const name = url.searchParams.get("name");
+          res.setHeader("Content-Type", "application/json");
+          if (!video || !name) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: "Missing video or name" }));
+            return;
+          }
+          if (name.startsWith("_") || name.includes("/") || name.includes("\\") || name.includes("..")) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: "Invalid analysis name" }));
+            return;
+          }
+          const stem = path.basename(video, path.extname(video));
+          const runDir = path.join(ANALYSIS_DIR, stem, name);
+          try {
+            if (fs.existsSync(runDir)) fs.rmSync(runDir, { recursive: true, force: true });
+            reconstructJobs.delete(`${video}::${name}`);
+            console.log(`[delete] removed analysis ${runDir}`);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (err: any) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: err?.message ?? String(err) }));
+          }
+          return;
+        }
+        next();
       });
 
       // GET /api/analysis-result?video=<filename>&name=<name> — load a previous result
