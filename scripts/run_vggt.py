@@ -218,7 +218,11 @@ def main():
     parser.add_argument("scene_dir", help="Path to _scene directory")
     parser.add_argument("--anchor-step", type=int, default=10,
                         help="Phase-1 anchor density: every Mth frame is an "
-                             "anchor (default 10)")
+                             "anchor (default 10). Ignored if --num-frames is set.")
+    parser.add_argument("--num-frames", type=int, default=None,
+                        help="Target total anchor frames. When set, overrides "
+                             "--anchor-step and picks exactly N evenly-spaced "
+                             "frames from 0 to last (inclusive).")
     parser.add_argument("--interior-step", type=int, default=1,
                         help="Phase-2 density: within each span, take every "
                              "Nth interior frame (default 1 = all interiors)")
@@ -258,9 +262,18 @@ def main():
     N = len(frames_to_use)
     print(f"[vggt] {N} frames at {src_w}x{src_h}")
 
-    # Anchor set: every Mth frame, plus the last frame so the final
-    # span has a bracketing anchor.
-    anchor_positions = sorted(set(list(range(0, N, args.anchor_step)) + [N - 1]))
+    # Anchor set: either exactly T evenly-spaced positions (when
+    # --num-frames is set) or every Mth frame plus the last frame.
+    if args.num_frames is not None and args.num_frames > 0:
+        T = min(args.num_frames, N)
+        if T <= 1:
+            anchor_positions = [0]
+        else:
+            anchor_positions = sorted({
+                round(i * (N - 1) / (T - 1)) for i in range(T)
+            })
+    else:
+        anchor_positions = sorted(set(list(range(0, N, args.anchor_step)) + [N - 1]))
     print(f"[vggt] {len(anchor_positions)} anchors, "
           f"{len(anchor_positions) - 1} span(s) to fill")
 

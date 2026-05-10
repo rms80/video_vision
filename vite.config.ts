@@ -311,19 +311,9 @@ function segViewerPlugin(): Plugin {
                   }
                   if (plugin.id === "vggt" && step.script === "run_vggt.py"
                       && options && Number.isFinite(Number(options.numFrames))) {
-                    const framesJson = path.join(sd, "frames.json");
-                    try {
-                      const meta = JSON.parse(fs.readFileSync(framesJson, "utf-8"));
-                      const N = Number(meta.frame_count);
-                      const T = Math.max(1, Math.round(Number(options.numFrames)));
-                      if (Number.isFinite(N) && N > 0) {
-                        const anchorStep = Math.max(1, Math.round(N / T));
-                        args.push("--anchor-step", String(anchorStep));
-                        console.log(`[scene:vggt] targeting ${T} frames over ${N}: --anchor-step ${anchorStep}`);
-                      }
-                    } catch (e: any) {
-                      console.warn(`[scene:vggt] failed to read frames.json for numFrames: ${e?.message}`);
-                    }
+                    const T = Math.max(1, Math.round(Number(options.numFrames)));
+                    args.push("--num-frames", String(T));
+                    console.log(`[scene:vggt] targeting ${T} frames`);
                   }
                   console.log(`[scene:${plugin.id}] ${video}: ${step.stage} (${step.script})`);
                   await runPython(path.join(SCRIPTS_DIR, step.script), args, logPath);

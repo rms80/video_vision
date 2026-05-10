@@ -219,13 +219,19 @@ export default function App() {
   });
 
   // VGGT target total-frame count (shown only when VGGT is selected).
-  // The backend converts this to --anchor-step based on frames.json.
+  // Sent to the backend as --num-frames; the backend picks exactly that
+  // many evenly-spaced anchors. After a run, sync the input from
+  // num_registered so switching to an existing analysis shows what was
+  // computed; reset to 15 when no VGGT analysis exists for the video.
   const [vggtNumFrames, setVggtNumFrames] = createSignal<string>("15");
   createEffect(() => {
     if (sceneSource() !== "vggt") return;
     const cam = cameras();
-    const n = cam?.num_registered;
-    if (typeof n === "number" && n > 0) setVggtNumFrames(String(n));
+    if (cam && typeof cam.num_registered === "number" && cam.num_registered > 0) {
+      setVggtNumFrames(String(cam.num_registered));
+    } else {
+      setVggtNumFrames("15");
+    }
   });
   // Fall back from "3D (Scene)" tab when switching to a plugin that doesn't support it
   createEffect(() => {
