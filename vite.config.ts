@@ -304,7 +304,8 @@ function segViewerPlugin(): Plugin {
                   const args = step.args.map((a) =>
                     a === "$VIDEO" ? videoPath : a === "$SCENE" ? sd : a,
                   );
-                  if (plugin.id === "pi3" && step.script === "run_pi3.py"
+                  if ((plugin.id === "pi3" || plugin.id === "da3")
+                      && (step.script === "run_pi3.py" || step.script === "run_da3.py")
                       && options && Number.isFinite(Number(options.subsample))) {
                     const n = Math.max(1, Math.round(Number(options.subsample)));
                     args.push("--subsample", String(n));

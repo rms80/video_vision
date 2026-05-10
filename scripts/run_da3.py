@@ -53,8 +53,8 @@ def free_cuda():
 def main():
     parser = argparse.ArgumentParser(description="Run DA3 (pose + metric depth)")
     parser.add_argument("scene_dir", help="Path to _scene directory")
-    parser.add_argument("--subsample", type=int, default=1,
-                        help="Use every Nth frame (default 1 = all)")
+    parser.add_argument("--subsample", type=int, default=2,
+                        help="Use every Nth frame (default 2)")
     parser.add_argument("--process-res", type=int, default=504,
                         help="DA3 processing resolution (default 504)")
     args = parser.parse_args()

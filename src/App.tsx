@@ -208,7 +208,7 @@ export default function App() {
   createEffect(() => localStorage.setItem("segviewer:viewTab", viewTab()));
 
   // Pi3 subsample rate (shown only when Pi3 is selected).
-  const [pi3Subsample, setPi3Subsample] = createSignal<string>("3");
+  const [pi3Subsample, setPi3Subsample] = createSignal<string>("2");
   // Restore from cameras.json whenever Pi3 is the active source and its
   // cameras load (refreshDepthFrames fetches them for the current plugin).
   createEffect(() => {
@@ -216,6 +216,15 @@ export default function App() {
     const cam = cameras();
     const n = cam?.subsample_every;
     if (typeof n === "number" && n > 0) setPi3Subsample(String(n));
+  });
+
+  // DA3 subsample rate (shown only when DA3 is selected).
+  const [da3Subsample, setDa3Subsample] = createSignal<string>("2");
+  createEffect(() => {
+    if (sceneSource() !== "da3") return;
+    const cam = cameras();
+    const n = cam?.subsample_every;
+    if (typeof n === "number" && n > 0) setDa3Subsample(String(n));
   });
 
   // VGGT target total-frame count (shown only when VGGT is selected).
@@ -810,6 +819,10 @@ export default function App() {
         const n = Math.max(1, Math.round(Number(pi3Subsample())));
         if (Number.isFinite(n)) options.subsample = n;
       }
+      if (pluginId === "da3") {
+        const n = Math.max(1, Math.round(Number(da3Subsample())));
+        if (Number.isFinite(n)) options.subsample = n;
+      }
       if (pluginId === "vggt") {
         const n = Math.max(1, Math.round(Number(vggtNumFrames())));
         if (Number.isFinite(n)) options.numFrames = n;
@@ -1331,6 +1344,29 @@ export default function App() {
                     step="1"
                     value={pi3Subsample()}
                     onInput={(e) => setPi3Subsample(e.currentTarget.value)}
+                    style={{
+                      width: "60px",
+                      padding: "4px 6px",
+                      background: "#0a0e1a",
+                      border: "1px solid #0f3460",
+                      color: "#e0e0e0",
+                      "border-radius": "3px",
+                      "font-size": "12px",
+                      "font-family": "inherit",
+                    }}
+                  />
+                  <span style={{ "font-size": "11px", color: "#888" }}>frames</span>
+                </div>
+              </Show>
+              <Show when={sceneSource() === "da3"}>
+                <div style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}>
+                  <label style={{ "font-size": "11px", color: "#aaa" }}>Subsample every</label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={da3Subsample()}
+                    onInput={(e) => setDa3Subsample(e.currentTarget.value)}
                     style={{
                       width: "60px",
                       padding: "4px 6px",

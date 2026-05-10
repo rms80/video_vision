@@ -66,8 +66,8 @@ def depth_edge(depth, rtol=0.03, kernel_size=3):
 def main():
     parser = argparse.ArgumentParser(description="Run Pi3X on video frames")
     parser.add_argument("scene_dir", help="Path to _scene directory")
-    parser.add_argument("--subsample", type=int, default=3,
-                        help="Use every Nth frame (default 3)")
+    parser.add_argument("--subsample", type=int, default=2,
+                        help="Use every Nth frame (default 2)")
     args = parser.parse_args()
 
     scene_dir = args.scene_dir
