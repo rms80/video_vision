@@ -154,23 +154,32 @@ export default function App() {
     }
   });
 
-  // Global keyboard handler for floor-click mode
+  // Global keyboard handler: floor-click mode + arrow-key frame nav
   function handleGlobalKey(e: KeyboardEvent) {
-    if (!settingFloor()) return;
-    if (e.key === "Escape") {
-      setSettingFloor(false);
-      setFloorPoints([]);
-      setStatus("World-up point selection cancelled");
-    } else if (e.key === "Enter") {
-      setSettingFloor(false);
-      const pts = floorPoints();
-      if (pts.length < 3) {
-        setStatus(`Need at least 3 world-up points (have ${pts.length})`);
-      } else {
-        const v = videoName();
-        if (v) saveWorldUp(v, pts);
-        setStatus(`${pts.length} world-up points saved — click "Align Scene"`);
+    if (settingFloor()) {
+      if (e.key === "Escape") {
+        setSettingFloor(false);
+        setFloorPoints([]);
+        setStatus("World-up point selection cancelled");
+      } else if (e.key === "Enter") {
+        setSettingFloor(false);
+        const pts = floorPoints();
+        if (pts.length < 3) {
+          setStatus(`Need at least 3 world-up points (have ${pts.length})`);
+        } else {
+          const v = videoName();
+          if (v) saveWorldUp(v, pts);
+          setStatus(`${pts.length} world-up points saved — click "Align Scene"`);
+        }
       }
+      return;
+    }
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
+      e.preventDefault();
+      navigateFrames(e.key === "ArrowRight" ? 1 : -1);
     }
   }
   onMount(() => { window.addEventListener("keydown", handleGlobalKey); });
@@ -932,6 +941,45 @@ export default function App() {
     videoEl.currentTime = newTime;
     setCurrentTime(newTime);
     setCurrentFrame(Math.floor(newTime * fps()));
+  }
+
+  // Arrow-key navigation. On the source tab steps one frame at a time;
+  // on data-bearing tabs jumps to the next/previous frame that actually
+  // has data for that view.
+  function navigateFrames(dir: 1 | -1) {
+    if (!videoEl) return;
+    const tab = viewTab();
+    if (tab === "source") {
+      stepFrame(dir);
+      return;
+    }
+    let keyframes: number[];
+    if (tab === "depth") {
+      keyframes = depthFrames();
+    } else {
+      const cam = cameras();
+      keyframes = cam ? cam.frames.filter((f) => f.registered).map((f) => f.idx) : [];
+    }
+    if (keyframes.length === 0) return;
+    const sorted = [...keyframes].sort((a, b) => a - b);
+    const cur = currentFrame();
+    let target: number | undefined;
+    if (dir === 1) {
+      target = sorted.find((f) => f > cur);
+    } else {
+      for (const f of sorted) {
+        if (f >= cur) break;
+        target = f;
+      }
+    }
+    if (target === undefined) return;
+    videoEl.pause();
+    setPlaying(false);
+    stopTimeTracking();
+    const newTime = Math.max(0, Math.min(target / fps(), duration()));
+    videoEl.currentTime = newTime;
+    setCurrentTime(newTime);
+    setCurrentFrame(target);
   }
 
   function handleVideoLoaded() {
