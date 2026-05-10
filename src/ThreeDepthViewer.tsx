@@ -1088,6 +1088,23 @@ export default function ThreeDepthViewer(props: ThreeDepthViewerProps) {
         inset: "0",
         display: props.visible ? "block" : "none",
       }}
-    />
+    >
+      <div
+        style={{
+          position: "absolute",
+          top: "2px",
+          right: "8px",
+          padding: "4px 8px",
+          background: "rgba(0, 0, 0, 0.55)",
+          color: "#888",
+          font: "11px/1.4 ui-monospace, Consolas, monospace",
+          "border-radius": "4px",
+          "pointer-events": "none",
+          "user-select": "none",
+        }}
+      >
+        keys: [f]ocus  [c]enter
+      </div>
+    </div>
   );
 }
