@@ -52,7 +52,6 @@ export default function App() {
   const fps = () => 30;
   const [dragOver, setDragOver] = createSignal(false);
   const [status, setStatus] = createSignal("Drop a video file to begin");
-  const [prompt, setPrompt] = createSignal("");
   const [detectLabel, setDetectLabel] = createSignal("chair");
   const [settingSeed, setSettingSeed] = createSignal(false);
   const [seedPoint, setSeedPoint] = createSignal<{ x: number; y: number } | null>(null);
@@ -1335,14 +1334,6 @@ export default function App() {
     return `${m}:${s.padStart(5, "0")}`;
   }
 
-  function handlePromptKeyDown(e: KeyboardEvent) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      // TODO: send prompt to backend
-      setStatus(`Prompt: ${prompt()}`);
-    }
-  }
-
   // ── Styles ──
   const sidebarStyle = {
     width: "280px",
@@ -1409,13 +1400,11 @@ export default function App() {
   });
 
   return (
-    <div style={{ display: "flex", "flex-direction": "column", width: "100%", height: "100%" }}>
-      {/* Top row: sidebar + viewport */}
-      <div style={{ display: "flex", flex: "1", "min-height": "0" }}>
-        {/* ── Sidebar ── */}
-        <div style={sidebarStyle}>
+    <div style={{ display: "flex", width: "100%", height: "100%" }}>
+      {/* ── Sidebar (full window height) ── */}
+      <div style={sidebarStyle}>
           <div style={headerStyle}>
-            <span style={titleStyle}>Seg Viewer</span>
+            <span style={titleStyle}>VideoVision</span>
           </div>
 
           <div style={{ "overflow-y": "auto", flex: "1", padding: "0" }}>
@@ -1957,6 +1946,8 @@ export default function App() {
           </div>
         </div>
 
+        {/* Right column: viewport + bottom status bar */}
+        <div style={{ display: "flex", "flex-direction": "column", flex: "1", "min-width": "0" }}>
         {/* ── Main Viewport ── */}
         <div
           style={{
@@ -1965,6 +1956,7 @@ export default function App() {
             display: "flex",
             "flex-direction": "column",
             "min-width": "0",
+            "min-height": "0",
           }}
         >
           {/* Tab bar */}
@@ -2489,38 +2481,21 @@ export default function App() {
             </div>
           </Show>
         </div>
-      </div>
 
-      {/* ── Bottom prompt/status bar ── */}
+      {/* ── Bottom status bar ── */}
       <div style={{
         background: "#16213e",
         "border-top": "1px solid #0f3460",
         padding: "10px 16px",
         display: "flex",
         gap: "12px",
-        "align-items": "flex-start",
+        "align-items": "stretch",
+        "min-height": "0",
       }}>
-        <textarea
-          value={prompt()}
-          onInput={(e) => setPrompt(e.currentTarget.value)}
-          onKeyDown={handlePromptKeyDown}
-          placeholder="Enter prompt... (Enter to send)"
-          rows={2}
-          style={{
-            flex: "1",
-            padding: "8px",
-            background: "#0a0e1a",
-            border: "1px solid #0f3460",
-            color: "#e0e0e0",
-            "border-radius": "4px",
-            "font-size": "13px",
-            "font-family": "inherit",
-            resize: "vertical",
-          }}
-        />
-        <div style={{ flex: "1", display: "flex", "flex-direction": "column", gap: "4px" }}>
+        <div style={{ flex: "1", display: "flex", "flex-direction": "column", gap: "4px", "min-height": "0" }}>
           <div
             style={{
+              flex: "1",
               padding: "8px",
               background: "#0a0e1a",
               border: "1px solid #0f3460",
@@ -2528,7 +2503,6 @@ export default function App() {
               "font-size": "12px",
               color: "#888",
               "min-height": "36px",
-              "max-height": "120px",
               "overflow-y": "auto",
               "white-space": "pre-wrap",
             }}
@@ -2570,6 +2544,7 @@ export default function App() {
             );
           })()}
         </div>
+      </div>
       </div>
     </div>
   );
