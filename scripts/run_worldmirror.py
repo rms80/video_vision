@@ -30,8 +30,8 @@ import time
 import types
 from pathlib import Path
 
-# Make the HunyuanWorld-Mirror checkout importable (sibling of sam_experiments).
-WORLDMIRROR_ROOT = Path(__file__).resolve().parent.parent.parent / "hunyuanworld-mirror"
+# Make the HunyuanWorld-Mirror checkout importable.
+WORLDMIRROR_ROOT = Path(__file__).resolve().parent.parent / "models" / "external" / "hunyuanworld-mirror"
 sys.path.insert(0, str(WORLDMIRROR_ROOT))
 
 # `gsplat` is a CUDA-compiled package used only by the gaussian-splatting head

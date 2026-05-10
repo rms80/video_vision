@@ -31,8 +31,8 @@ import time
 import types
 from pathlib import Path
 
-# Make the HY-World-2.0 checkout importable (sibling of sam_experiments).
-HYWORLD2_ROOT = Path(__file__).resolve().parent.parent.parent / "hy-world-2.0"
+# Make the HY-World-2.0 checkout importable.
+HYWORLD2_ROOT = Path(__file__).resolve().parent.parent / "models" / "external" / "hy-world-2.0"
 sys.path.insert(0, str(HYWORLD2_ROOT))
 
 # Stub `gsplat` (CUDA-compiled; only used by GaussianSplatRenderer which we
