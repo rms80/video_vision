@@ -1,0 +1,44 @@
+diff --git a/src/croco/models/pos_embed.py b/src/croco/models/pos_embed.py
+index 0f76e4d..9dd38fc 100644
+--- a/src/croco/models/pos_embed.py
++++ b/src/croco/models/pos_embed.py
+@@ -168,12 +168,23 @@ except ImportError:
+             ), "number of dimensions should be a multiple of two"
+             D = tokens.size(3) // 2
+             assert positions.ndim == 3 and positions.shape[-1] == 2  # Batch, Seq, 2
++            # Negative positions (e.g. -1 for pose tokens) mean "no positional
++            # encoding".  Clamp to 0 for the embedding lookup, then restore
++            # the original (unrotated) tokens at those positions.
++            neg_mask = (positions < 0).any(dim=-1)  # (B, S)
++            has_neg = neg_mask.any()
++            safe_positions = positions.clamp(min=0)
++            if has_neg:
++                orig_tokens = tokens.clone()
+             cos, sin = self.get_cos_sin(
+-                D, int(positions.max()) + 1, tokens.device, tokens.dtype
++                D, int(safe_positions.max()) + 1, tokens.device, tokens.dtype
+             )
+             # split features into two along the feature dimension, and apply rope1d on each half
+             y, x = tokens.chunk(2, dim=-1)
+-            y = self.apply_rope1d(y, positions[:, :, 0], cos, sin)
+-            x = self.apply_rope1d(x, positions[:, :, 1], cos, sin)
++            y = self.apply_rope1d(y, safe_positions[:, :, 0], cos, sin)
++            x = self.apply_rope1d(x, safe_positions[:, :, 1], cos, sin)
+             tokens = torch.cat((y, x), dim=-1)
++            if has_neg:
++                mask = neg_mask[:, None, :, None].expand_as(tokens)
++                tokens = torch.where(mask, orig_tokens, tokens)
+             return tokens
+diff --git a/src/dust3r/model.py b/src/dust3r/model.py
+index 7ed9f61..90a4ddf 100644
+--- a/src/dust3r/model.py
++++ b/src/dust3r/model.py
+@@ -72,7 +72,7 @@ def strip_module(state_dict):
+ def load_model(model_path, device, verbose=True):
+     if verbose:
+         print("... loading model from", model_path)
+-    ckpt = torch.load(model_path, map_location="cpu")
++    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+     args = ckpt["args"].model.replace(
+         "ManyAR_PatchEmbed", "PatchEmbedDust3R"
+     )  # ManyAR only for aspect ratio not consistent

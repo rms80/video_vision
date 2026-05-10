@@ -6,6 +6,8 @@ Stdlib-only so it can be imported by 00_venv.py before the venv exists.
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -142,6 +144,107 @@ def clone_repo(url: str, dest: Path, commit: str | None = None,
                 )
 
     return dest
+
+
+def install_requirements_filtered(
+    req_path: Path,
+    skip_names: tuple[str, ...] = ("torch", "torchvision", "numpy", "pillow"),
+) -> None:
+    """Install a requirements.txt into the venv, skipping packages whose
+    canonical name appears in skip_names. Use this for repo requirements
+    that pin versions of packages we already control in the base venv
+    (e.g. CUDA-built torch). URL/VCS entries (`pkg @ url`) are filtered
+    by the leading name too."""
+    pkgs: list[str] = []
+    skipped: list[str] = []
+    for raw in Path(req_path).read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name = re.split(r"[\s<>=!~\[@]", line, 1)[0].strip().lower()
+        if name in skip_names:
+            skipped.append(line)
+            continue
+        pkgs.append(line)
+    if skipped:
+        print(f"[setup] skipping pinned deps: {', '.join(skipped)}")
+    if pkgs:
+        pip_install(*pkgs)
+
+
+def find_nvcc() -> Path | None:
+    """Locate nvcc. Tries PATH, then CUDA_PATH/CUDA_HOME, then default
+    Windows install paths. Returns None if not found."""
+    found = shutil.which("nvcc")
+    if found:
+        return Path(found)
+    for var in ("CUDA_PATH", "CUDA_HOME"):
+        cuda = os.environ.get(var)
+        if cuda:
+            nvcc = Path(cuda) / "bin" / ("nvcc.exe" if sys.platform == "win32" else "nvcc")
+            if nvcc.exists():
+                return nvcc
+    if sys.platform == "win32":
+        pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        cuda_root = pf / "NVIDIA GPU Computing Toolkit" / "CUDA"
+        if cuda_root.is_dir():
+            for v in sorted(cuda_root.glob("v*"), reverse=True):
+                nvcc = v / "bin" / "nvcc.exe"
+                if nvcc.exists():
+                    return nvcc
+    return None
+
+
+def find_vcvars() -> Path | None:
+    """Locate vcvars64.bat on Windows. Tries vswhere.exe first, then
+    standard install paths. Returns None on non-Windows or if not found."""
+    if sys.platform != "win32":
+        return None
+    pfx86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    vswhere = pfx86 / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        try:
+            r = subprocess.run(
+                [str(vswhere), "-latest", "-products", "*",
+                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                capture_output=True, text=True, check=True,
+            )
+            install = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+            if install:
+                vcvars = Path(install) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if vcvars.is_file():
+                    return vcvars
+        except subprocess.CalledProcessError:
+            pass
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    for prog in (pf, pfx86):
+        for year in ("2022", "2019"):
+            for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
+                p = prog / "Microsoft Visual Studio" / year / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if p.is_file():
+                    return p
+    return None
+
+
+def apply_patch(patch_path: Path, repo_dir: Path) -> None:
+    """Apply a unified-diff patch to a local git checkout. Idempotent: if
+    the patch already applies cleanly in reverse, treat it as already
+    applied and skip."""
+    patch_path = Path(patch_path)
+    repo_dir = Path(repo_dir)
+    reverse = subprocess.run(
+        ["git", "-C", str(repo_dir), "apply", "--reverse", "--check", str(patch_path)],
+        capture_output=True,
+    )
+    if reverse.returncode == 0:
+        print(f"[patch] {patch_path.name} already applied to {repo_dir.name}")
+        return
+    print(f"[patch] applying {patch_path.name} to {repo_dir.name}")
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "apply", str(patch_path)],
+        check=True,
+    )
 
 
 def hf_snapshot(repo_id: str, allow_patterns: list[str] | None = None,
