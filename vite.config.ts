@@ -1,6 +1,7 @@
 import { defineConfig, Plugin } from "vite";
 import solidPlugin from "vite-plugin-solid";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import ffmpegPath from "ffmpeg-static";
@@ -269,6 +270,53 @@ function runPython(
   });
 }
 
+function hfCacheRoot(): string {
+  if (process.env.HF_HUB_CACHE) return process.env.HF_HUB_CACHE;
+  if (process.env.HF_HOME) return path.join(process.env.HF_HOME, "hub");
+  return path.join(os.homedir(), ".cache", "huggingface", "hub");
+}
+
+function existsOnPath(cmd: string): boolean {
+  const dirs = (process.env.PATH ?? "").split(path.delimiter);
+  const exts = process.platform === "win32"
+    ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";")
+    : [""];
+  for (const d of dirs) {
+    if (!d) continue;
+    for (const ext of exts) {
+      try { if (fs.existsSync(path.join(d, cmd + ext))) return true; } catch {}
+    }
+  }
+  return false;
+}
+
+type AvailabilitySpec = {
+  paths?: string[];
+  commands?: string[];
+  hfRepos?: string[];
+};
+
+function isAvailable(a: AvailabilitySpec | undefined): boolean {
+  if (!a) return true;
+  for (const p of a.paths ?? []) {
+    if (!fs.existsSync(path.resolve(__dirname, p))) return false;
+  }
+  for (const cmd of a.commands ?? []) {
+    if (!existsOnPath(cmd)) return false;
+  }
+  if (a.hfRepos?.length) {
+    const cache = hfCacheRoot();
+    for (const repo of a.hfRepos) {
+      const dir = path.join(cache, "models--" + repo.replace(/\//g, "--"));
+      if (!fs.existsSync(dir)) return false;
+    }
+  }
+  return true;
+}
+
+const SAM2_WEIGHTS = path.resolve(__dirname, "models", "weights", "sam2.1_l.pt");
+const SAM3_WEIGHTS = path.resolve(__dirname, "models", "weights", "sam3.pt");
+
 function segViewerPlugin(): Plugin {
   return {
     name: "seg-viewer",
@@ -286,13 +334,18 @@ function segViewerPlugin(): Plugin {
           "--format=csv,noheader,nounits",
         ]);
         let out = "";
+        let responded = false;
         proc.stdout.on("data", (c: Buffer) => (out += c.toString()));
         proc.on("error", (err) => {
+          if (responded) return;
+          responded = true;
           res.statusCode = 500;
           res.setHeader("Content-Type", "application/json");
           res.end(JSON.stringify({ error: err.message }));
         });
         proc.on("close", () => {
+          if (responded) return;
+          responded = true;
           res.setHeader("Content-Type", "application/json");
           const line = out.split(/\r?\n/).find((l) => l.trim()) ?? "";
           const [u, t, g] = line.split(",").map((s) => Number(s.trim()));
@@ -303,6 +356,24 @@ function segViewerPlugin(): Plugin {
           }
           res.end(JSON.stringify({ used: u, total: t, util: Number.isFinite(g) ? g : null }));
         });
+      });
+
+      // GET /api/availability — which models/plugins have their setup installed.
+      // Drives whether each scene plugin / box solver appears in the UI and
+      // whether the SAM2/SAM3 buttons are enabled.
+      server.middlewares.use("/api/availability", (req, res, next) => {
+        if (req.method !== "GET") return next();
+        const scenePlugins: Record<string, boolean> = {};
+        for (const p of SCENE_PLUGINS) scenePlugins[p.id] = isAvailable(p.availability);
+        const boxSolvers: Record<string, boolean> = {};
+        for (const p of BOX_SOLVER_PLUGINS) boxSolvers[p.id] = isAvailable(p.availability);
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({
+          scenePlugins,
+          boxSolvers,
+          sam2: fs.existsSync(SAM2_WEIGHTS),
+          sam3: fs.existsSync(SAM3_WEIGHTS),
+        }));
       });
 
       // POST /api/upload — accept a video file upload (skips if same name+size exists)
@@ -325,6 +396,14 @@ function segViewerPlugin(): Plugin {
         const rawPath = path.join(TMP_DIR, `raw_${safeName}`);
         const ws = fs.createWriteStream(rawPath);
         req.pipe(ws);
+        let responded = false;
+        const respond = (status: number, body: object) => {
+          if (responded) return;
+          responded = true;
+          res.statusCode = status;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify(body));
+        };
         ws.on("finish", () => {
           // Re-encode with keyframes every half second (-g 15 at 30fps)
           console.log(`[upload] re-encoding ${safeName} with half-second keyframes...`);
@@ -336,13 +415,11 @@ function segViewerPlugin(): Plugin {
           let stderr = "";
           ff.stderr.on("data", (c: Buffer) => (stderr += c.toString()));
           ff.on("close", async (code) => {
-            // Clean up raw file
             try { fs.unlinkSync(rawPath); } catch {}
+            if (responded) return;
             if (code !== 0) {
               console.error(`[upload] ffmpeg error: ${stderr}`);
-              res.statusCode = 500;
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ error: `Re-encode failed: ${stderr.slice(-200)}` }));
+              respond(500, { error: `Re-encode failed: ${stderr.slice(-200)}` });
               return;
             }
             console.log(`[upload] re-encoded ${safeName} successfully`);
@@ -359,24 +436,19 @@ function segViewerPlugin(): Plugin {
                 path.join(sd, "extract_frames.log"),
               );
               console.log(`[upload] frames extracted for ${safeName}`);
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ ok: true, filename: safeName }));
+              respond(200, { ok: true, filename: safeName });
             } catch (err: any) {
               console.error(`[upload] extract_frames failed: ${err?.message ?? err}`);
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ ok: true, filename: safeName, framesExtracted: false }));
+              respond(200, { ok: true, filename: safeName, framesExtracted: false });
             }
           });
           ff.on("error", (err) => {
             try { fs.unlinkSync(rawPath); } catch {}
-            res.statusCode = 500;
-            res.setHeader("Content-Type", "application/json");
-            res.end(JSON.stringify({ error: err.message }));
+            respond(500, { error: err.message });
           });
         });
         ws.on("error", (err) => {
-          res.statusCode = 500;
-          res.end(JSON.stringify({ error: err.message }));
+          respond(500, { error: err.message });
         });
       });
 

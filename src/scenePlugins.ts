@@ -77,6 +77,21 @@ export interface ScenePlugin {
    * every step in the pipeline.
    */
   subsampleScript?: string;
+  /**
+   * Checks the backend runs to decide whether this plugin is installed
+   * (i.e. its setup script has been run). Plugin is "available" iff every
+   * listed file/dir path exists, every command resolves on PATH, and
+   * every HF repo is present in the local HuggingFace cache. Unset =
+   * always available (no install needed).
+   */
+  availability?: {
+    /** Filesystem paths, relative to the repo root. */
+    paths?: string[];
+    /** Binary names that must resolve via $PATH. */
+    commands?: string[];
+    /** HuggingFace repo IDs ("org/name") that must be present in the HF cache. */
+    hfRepos?: string[];
+  };
 }
 
 export const SCENE_PLUGINS: ScenePlugin[] = [
@@ -96,6 +111,10 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     subsampleDefault: 3,
     subsampleFlag: "--every",
     subsampleScript: "run_colmap.py",
+    availability: {
+      commands: ["colmap"],
+      hfRepos: ["depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"],
+    },
   },
   {
     id: "cut3r",
@@ -112,6 +131,9 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     requiresFrames: true,
     features: { pointmap: true },
     subsampleDefault: 2,
+    availability: {
+      paths: ["models/external/cut3r/src/cut3r_512_dpt_4_64.pth"],
+    },
   },
   {
     id: "vggt",
@@ -127,6 +149,10 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "vggt",
     requiresFrames: true,
     features: { pointmap: true },
+    availability: {
+      paths: ["models/external/vggt"],
+      hfRepos: ["facebook/VGGT-1B"],
+    },
   },
   {
     id: "da3",
@@ -143,6 +169,9 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     requiresFrames: true,
     features: { pointmap: true },
     subsampleDefault: 2,
+    availability: {
+      paths: ["models/external/depth-anything-3"],
+    },
   },
   {
     id: "pi3",
@@ -159,6 +188,9 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     requiresFrames: true,
     features: { pointmap: true, scenePointmap: true },
     subsampleDefault: 2,
+    availability: {
+      hfRepos: ["yyfz233/Pi3X"],
+    },
   },
   {
     id: "mapanything",
@@ -175,6 +207,9 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     requiresFrames: true,
     features: { pointmap: true, scenePointmap: true },
     subsampleDefault: 3,
+    availability: {
+      hfRepos: ["facebook/map-anything"],
+    },
   },
   {
     id: "worldmirror2",
@@ -191,6 +226,10 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     requiresFrames: true,
     features: { pointmap: true, scenePointmap: true },
     subsampleDefault: 3,
+    availability: {
+      paths: ["models/external/hy-world-2.0"],
+      hfRepos: ["tencent/HY-World-2.0"],
+    },
   },
   {
     id: "worldmirror",
@@ -207,6 +246,10 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     requiresFrames: true,
     features: { pointmap: true, scenePointmap: true },
     subsampleDefault: 3,
+    availability: {
+      paths: ["models/external/hunyuanworld-mirror"],
+      hfRepos: ["tencent/HunyuanWorld-Mirror"],
+    },
   },
   {
     id: "wilddet3d",
@@ -222,6 +265,9 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "wilddet3d",
     requiresFrames: true,
     subsampleDefault: 10,
+    availability: {
+      paths: ["models/external/wilddet3d"],
+    },
   },
 ];
 

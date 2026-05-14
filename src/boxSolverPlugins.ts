@@ -35,6 +35,16 @@ export interface BoxSolverPlugin {
   requiresDepth: boolean;
   /** Boolean toggles surfaced in the UI under the dropdown. */
   options: BoxSolverOption[];
+  /**
+   * Backend installation check. Same semantics as ScenePlugin.availability:
+   * solver is "available" iff every path exists, every command resolves on
+   * PATH, and every HF repo is present in the local HuggingFace cache.
+   */
+  availability?: {
+    paths?: string[];
+    commands?: string[];
+    hfRepos?: string[];
+  };
 }
 
 export const BOX_SOLVER_PLUGINS: BoxSolverPlugin[] = [
@@ -55,6 +65,9 @@ export const BOX_SOLVER_PLUGINS: BoxSolverPlugin[] = [
         defaultValue: true,
       },
     ],
+    availability: {
+      paths: ["models/external/boxer/ckpts/boxernet_hw960in4x6d768-wssxpf9p.ckpt"],
+    },
   },
   {
     id: "wilddet3d",
@@ -80,6 +93,9 @@ export const BOX_SOLVER_PLUGINS: BoxSolverPlugin[] = [
         defaultValue: false,
       },
     ],
+    availability: {
+      paths: ["models/external/wilddet3d"],
+    },
   },
 ];
 

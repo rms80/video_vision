@@ -71,6 +71,19 @@ def main() -> None:
 
     print(f"[venv] done. venv python: {_lib.venv_python()}")
 
+    if sys.platform == "darwin":
+        result = _lib.run_in_venv(
+            ["-c", "import torch, sys; "
+                   "sys.exit(0 if torch.backends.mps.is_available() else 1)"],
+            check=False, capture_output=True,
+        )
+        if result.returncode != 0:
+            print()
+            print("[venv] WARNING: PyTorch MPS (Metal GPU) is not available.")
+            print("[venv]   Models will fall back to CPU. On Apple Silicon this usually means")
+            print("[venv]   torch was installed as x86_64 (Rosetta) instead of arm64, or you're")
+            print("[venv]   on macOS < 12.3.")
+
 
 if __name__ == "__main__":
     main()

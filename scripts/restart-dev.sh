@@ -8,12 +8,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SEGVIEWER_DIR="$(dirname "$SCRIPT_DIR")"
 
 echo "[restart-dev] checking port $PORT..."
-PIDS=$(netstat -ano | awk -v p=":$PORT" '$2 ~ p"$" && $4 == "LISTENING" {print $5}' | sort -u)
+
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    PIDS=$(netstat -ano | awk -v p=":$PORT" '$2 ~ p"$" && $4 == "LISTENING" {print $5}' | sort -u)
+    KILL_CMD=(taskkill //F //PID)
+    ;;
+  *)
+    PIDS=$(lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true)
+    KILL_CMD=(kill -9)
+    ;;
+esac
 
 if [[ -n "${PIDS:-}" ]]; then
   for pid in $PIDS; do
     echo "[restart-dev] killing PID $pid on port $PORT"
-    taskkill //F //PID "$pid" >/dev/null 2>&1 || true
+    "${KILL_CMD[@]}" "$pid" >/dev/null 2>&1 || true
   done
   sleep 1
 else

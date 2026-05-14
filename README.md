@@ -410,10 +410,5 @@ a new box solver is the same shape but in `src/boxSolverPlugins.ts`.
 
 ## Notes
 
-- The original `segviewer` project at `D:\git\sam_experiments\segviewer`
-  is the predecessor; some generated outputs and sample uploads still
-  live there if you need to compare runs.
 - Anything under `models/`, `uploads/`, `analysis/`, `tmp/`, and `*.pt`
   is gitignored.
-- See `ModelTasks.md` for the original cross-walk between this repo's
-  setup and the model checkouts in the predecessor project.

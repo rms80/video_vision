@@ -76,6 +76,26 @@ export default function App() {
   const [sceneSource, setSceneSource] = createSignal<string>(
     savedSceneSource && SCENE_PLUGINS_BY_ID[savedSceneSource] ? savedSceneSource : DEFAULT_SCENE_PLUGIN_ID,
   );
+  // null = not yet fetched; once loaded, only plugins/solvers with id in
+  // these sets are shown in their respective dropdowns. SAM2/SAM3 weights
+  // gate the Detect/Track buttons.
+  const [availablePluginIds, setAvailablePluginIds] = createSignal<Set<string> | null>(null);
+  const [availableBoxSolverIds, setAvailableBoxSolverIds] = createSignal<Set<string> | null>(null);
+  const [sam2Available, setSam2Available] = createSignal<boolean>(true);
+  const [sam3Available, setSam3Available] = createSignal<boolean>(true);
+  const availablePlugins = () => {
+    const set = availablePluginIds();
+    return set ? SCENE_PLUGINS.filter((p) => set.has(p.id)) : SCENE_PLUGINS;
+  };
+  const availableBoxSolvers = () => {
+    const set = availableBoxSolverIds();
+    return set ? BOX_SOLVER_PLUGINS.filter((p) => set.has(p.id)) : BOX_SOLVER_PLUGINS;
+  };
+  const SAM_INSTALL_HINT = "Run `python setup/sam.py` from the project root to download the weights, then refresh.";
+  const sam2DisabledReason = () => sam2Available() ? null
+    : `SAM2 weights not installed (expected models/weights/sam2.1_l.pt). ${SAM_INSTALL_HINT}`;
+  const sam3DisabledReason = () => sam3Available() ? null
+    : `SAM3 weights not installed (expected models/weights/sam3.pt). ${SAM_INSTALL_HINT}`;
   let scenePollTimer: number | undefined;
   type ViewTab = "source" | "depth" | "3d" | "3d-scene" | "3d-object";
   const storedTab = localStorage.getItem("segviewer:viewTab") as ViewTab | null;
@@ -192,6 +212,34 @@ export default function App() {
 
   // Fetch existing uploads on mount, then restore last session
   onMount(async () => {
+    try {
+      const r = await fetch("/api/availability");
+      if (r.ok) {
+        const data = await r.json();
+        const sceneIds = new Set(
+          Object.entries(data.scenePlugins ?? {})
+            .filter(([, v]) => v)
+            .map(([k]) => k),
+        );
+        setAvailablePluginIds(sceneIds);
+        if (!sceneIds.has(sceneSource())) {
+          const first = SCENE_PLUGINS.find((p) => sceneIds.has(p.id));
+          if (first) setSceneSource(first.id);
+        }
+        const solverIds = new Set(
+          Object.entries(data.boxSolvers ?? {})
+            .filter(([, v]) => v)
+            .map(([k]) => k),
+        );
+        setAvailableBoxSolverIds(solverIds);
+        if (!solverIds.has(boxSolverId())) {
+          const first = BOX_SOLVER_PLUGINS.find((p) => solverIds.has(p.id));
+          if (first) setBoxSolverId(first.id);
+        }
+        setSam2Available(Boolean(data.sam2));
+        setSam3Available(Boolean(data.sam3));
+      }
+    } catch {}
     await refreshVideoList();
     const savedVideo = localStorage.getItem("segviewer:video");
     const savedAnalysis = localStorage.getItem("segviewer:analysis");
@@ -1571,14 +1619,15 @@ export default function App() {
                 3D Scene Analysis
               </div>
               <select
-                value={sceneSource()}
+                value={availablePlugins().length === 0 ? "" : sceneSource()}
+                disabled={availablePlugins().length === 0}
                 onChange={(e) => {
                   setSceneSource(e.currentTarget.value);
                   setBoxResult(null);
                   const v = videoName();
                   if (v) refreshDepthFrames(v);
                 }}
-                title="Pick which scene-reconstruction method produces camera poses + per-frame depth. COLMAP is classical SfM (slow, robust, geometry-only). The neural plugins (CUT3R, VGGT, Pi3, MapAnything, WorldMirror, DA3) infer poses + depth in one feed-forward pass — usually faster and don't depend on COLMAP. Pi3 / MapAnything / WorldMirror also produce a global scene pointmap for the 3D (Scene) tab. WildDet3D additionally runs 3D object detection."
+                title="Pick which scene-reconstruction method produces camera poses + per-frame depth. COLMAP is classical SfM (slow, robust, geometry-only). The neural plugins (CUT3R, VGGT, Pi3, MapAnything, WorldMirror, DA3) infer poses + depth in one feed-forward pass — usually faster and don't depend on COLMAP. Pi3 / MapAnything / WorldMirror also produce a global scene pointmap for the 3D (Scene) tab. WildDet3D additionally runs 3D object detection. Only plugins whose setup script has been run appear here."
                 style={{
                   width: "100%",
                   padding: "6px 8px",
@@ -1589,12 +1638,17 @@ export default function App() {
                   "border-radius": "3px",
                   "font-size": "12px",
                   "font-family": "inherit",
-                  cursor: "pointer",
+                  cursor: availablePlugins().length === 0 ? "not-allowed" : "pointer",
                 }}
               >
-                <For each={SCENE_PLUGINS}>
-                  {(p) => <option value={p.id}>{p.label}</option>}
-                </For>
+                <Show
+                  when={availablePlugins().length > 0}
+                  fallback={<option value="">(none available)</option>}
+                >
+                  <For each={availablePlugins()}>
+                    {(p) => <option value={p.id}>{p.label}</option>}
+                  </For>
+                </Show>
               </select>
               <Show when={SCENE_PLUGINS_BY_ID[sceneSource()]?.subsampleDefault !== undefined}>
                 <div
@@ -1670,11 +1724,11 @@ export default function App() {
                   <button
                     style={isRunning()
                       ? { ...cancellableRunningStyle(), width: "100%" }
-                      : { ...accentBtnStyle(!!videoSrc(), isReady()), width: "100%" }}
+                      : { ...accentBtnStyle(!!videoSrc() && availablePlugins().length > 0, isReady()), width: "100%" }}
                     onMouseEnter={() => setHovered(true)}
                     onMouseLeave={() => setHovered(false)}
                     onClick={() => (isRunning() ? cancelScene() : runScenePlugin(sceneSource()))}
-                    disabled={!videoSrc()}
+                    disabled={!videoSrc() || availablePlugins().length === 0}
                     title={isRunning()
                       ? "Click to cancel the running scene-prep pipeline"
                       : isReady()
@@ -1766,17 +1820,20 @@ export default function App() {
                 style={detecting()
                   ? { ...cancellableRunningStyle(), width: "100%", "margin-top": "6px" }
                   : {
-                      ...accentBtnStyle(!!seedPoint() && !detecting(), !!detection()),
+                      ...accentBtnStyle(!!seedPoint() && !detecting() && sam3Available(), !!detection()),
                       width: "100%",
                       "margin-top": "6px",
                     }}
                 title={detecting()
                   ? "Click to cancel SAM3 detection"
-                  : detection()
-                  ? `Last detection: ${detection()!.label} (conf ${detection()!.confidence.toFixed(2)}) bbox=[${detection()!.bbox.join(", ")}]. Click to re-run.`
-                  : "Run SAM3 on frame 0 using the seed point + Object Label. Produces a 2D bounding box and segmentation mask, and creates a new analysis folder ('<label>_<N>') that holds every downstream artifact."}
+                  : [
+                      sam3DisabledReason(),
+                      detection()
+                        ? `Last detection: ${detection()!.label} (conf ${detection()!.confidence.toFixed(2)}) bbox=[${detection()!.bbox.join(", ")}]. Click to re-run.`
+                        : "Run SAM3 on frame 0 using the seed point + Object Label. Produces a 2D bounding box and segmentation mask, and creates a new analysis folder ('<label>_<N>') that holds every downstream artifact.",
+                    ].filter(Boolean).join("\n\n")}
                 onClick={() => (detecting() ? cancelDetect() : detectObject())}
-                disabled={!detecting() && !seedPoint()}
+                disabled={!detecting() && (!seedPoint() || !sam3Available())}
               >
                 {detecting() ? "Detecting (Click to Cancel)" : "Detect Object In Frame 0 (SAM3)"}
               </button>
@@ -1784,17 +1841,20 @@ export default function App() {
                 style={tracking()
                   ? { ...cancellableRunningStyle(), width: "100%", "margin-top": "6px" }
                   : {
-                      ...accentBtnStyle(!!currentAnalysis() && !tracking(), !!trackData()),
+                      ...accentBtnStyle(!!currentAnalysis() && !tracking() && sam2Available(), !!trackData()),
                       width: "100%",
                       "margin-top": "6px",
                     }}
                 title={tracking()
                   ? "Click to cancel SAM2 tracking"
-                  : trackData()
-                  ? `Tracked across ${trackData()!.frames.length} frames. Click to re-run.`
-                  : "Run SAM2 video tracking starting from the frame-0 detection mask. Produces a per-frame mask sequence (track.json) used by every downstream step — 3D box lifting, WildDet3D, and mesh reconstruction."}
+                  : [
+                      sam2DisabledReason(),
+                      trackData()
+                        ? `Tracked across ${trackData()!.frames.length} frames. Click to re-run.`
+                        : "Run SAM2 video tracking starting from the frame-0 detection mask. Produces a per-frame mask sequence (track.json) used by every downstream step — 3D box lifting, WildDet3D, and mesh reconstruction.",
+                    ].filter(Boolean).join("\n\n")}
                 onClick={() => (tracking() ? cancelTrack() : trackThroughVideo())}
-                disabled={!tracking() && !currentAnalysis()}
+                disabled={!tracking() && (!currentAnalysis() || !sam2Available())}
               >
                 {tracking() ? "Tracking (Click to Cancel)" : "Track Through Video (SAM2)"}
               </button>
@@ -1806,7 +1866,8 @@ export default function App() {
                 Object Placement
               </div>
               <select
-                value={boxSolverId()}
+                value={availableBoxSolvers().length === 0 ? "" : boxSolverId()}
+                disabled={availableBoxSolvers().length === 0}
                 onChange={(e) => {
                   const id = e.currentTarget.value;
                   setBoxSolverId(id);
@@ -1816,7 +1877,7 @@ export default function App() {
                   if (v && a) refreshBoxResult(v, a, id);
                   else setBoxResult(null);
                 }}
-                title="Pick which 3D-box solver runs when you click Compute Boxes. Boxer fits an oriented box from depth + masked point clouds (needs depth, supports per-frame or fused). WildDet3D is a neural detector that predicts 3D boxes directly from the image (no depth required, optionally takes K/depth as priors)."
+                title="Pick which 3D-box solver runs when you click Compute Boxes. Boxer fits an oriented box from depth + masked point clouds (needs depth, supports per-frame or fused). WildDet3D is a neural detector that predicts 3D boxes directly from the image (no depth required, optionally takes K/depth as priors). Only solvers whose setup script has been run appear here."
                 style={{
                   width: "100%",
                   padding: "6px 8px",
@@ -1827,12 +1888,17 @@ export default function App() {
                   "border-radius": "3px",
                   "font-size": "12px",
                   "font-family": "inherit",
-                  cursor: "pointer",
+                  cursor: availableBoxSolvers().length === 0 ? "not-allowed" : "pointer",
                 }}
               >
-                <For each={BOX_SOLVER_PLUGINS}>
-                  {(s) => <option value={s.id}>{s.label}</option>}
-                </For>
+                <Show
+                  when={availableBoxSolvers().length > 0}
+                  fallback={<option value="">(none available)</option>}
+                >
+                  <For each={availableBoxSolvers()}>
+                    {(s) => <option value={s.id}>{s.label}</option>}
+                  </For>
+                </Show>
               </select>
               <Show when={BOX_SOLVER_PLUGINS_BY_ID[boxSolverId()]?.options.length}>
                 <div style={{ display: "flex", "flex-wrap": "wrap", gap: "4px 12px", "margin-bottom": "6px" }}>
@@ -1875,11 +1941,15 @@ export default function App() {
                 const solver = () => BOX_SOLVER_PLUGINS_BY_ID[boxSolverId()];
                 const ready = () => !!boxResult();
                 const enabled = () => {
+                  if (availableBoxSolvers().length === 0) return false;
                   if (!trackData() || boxRunning()) return false;
-                  if (solver().requiresDepth && depthFrames().length === 0) return false;
+                  if (solver()?.requiresDepth && depthFrames().length === 0) return false;
                   return true;
                 };
                 const tip = () => {
+                  if (availableBoxSolvers().length === 0) {
+                    return "No 3D-box solver is installed. Run `python setup/boxer.py` (or `setup/wilddet3d.py`) to enable this.";
+                  }
                   if (boxRunning()) return `Click to cancel ${solver().label}`;
                   if (!trackData()) return "Run tracking first";
                   if (solver().requiresDepth && depthFrames().length === 0) {
