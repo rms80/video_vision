@@ -1529,7 +1529,7 @@ export default defineConfig({
     host: true,
     port: 4444,
     strictPort: true,
-    allowedHosts: ["basement"],
+    allowedHosts: ["basement", "basement-wsl"],
     fs: { allow: [".."] },
   },
 });

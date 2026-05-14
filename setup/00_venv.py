@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 import sys
 import venv
 from pathlib import Path
@@ -51,7 +52,19 @@ def main() -> None:
         print(f"[venv] creating {venv_path} "
               f"(python {sys.version_info.major}.{sys.version_info.minor})")
         venv_path.parent.mkdir(parents=True, exist_ok=True)
-        venv.EnvBuilder(with_pip=True, upgrade_deps=True).create(venv_path)
+        # On Linux, stdlib `venv` often fails: Debian/Ubuntu split out
+        # python3-venv, and uv's standalone Pythons omit the bundled pip
+        # wheel that `ensurepip` needs. If `uv` is on PATH, use it to
+        # create a seeded venv (includes pip) using the current interpreter.
+        uv = shutil.which("uv") if sys.platform == "linux" else None
+        if uv:
+            print(f"[venv] using uv ({uv}) to create seeded venv")
+            subprocess.run(
+                [uv, "venv", "--seed", "--python", sys.executable, str(venv_path)],
+                check=True,
+            )
+        else:
+            venv.EnvBuilder(with_pip=True, upgrade_deps=True).create(venv_path)
     else:
         print(f"[venv] reusing existing {venv_path}")
 
