@@ -18,11 +18,15 @@ import sys
 import os
 import json
 import argparse
+import contextlib
 
 import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
 
 # Add WildDet3D repo to path
 WILDDET3D_ROOT = os.path.normpath(
@@ -183,7 +187,7 @@ def main():
         sys.exit(1)
 
     # Device setup
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
     print(f"[wilddet3d] Using device: {device}")
 
     # Load WildDet3D model
@@ -264,7 +268,9 @@ def main():
 
         # Run inference
         # preprocess() returns images as (1, 3, H, W) and intrinsics as (3, 3)
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+        amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.float16)
+                   if device == "cuda" else contextlib.nullcontext())
+        with torch.no_grad(), amp_ctx:
             outputs = model(
                 images=data["images"].to(device),
                 intrinsics=data["intrinsics"].unsqueeze(0).to(device),

@@ -119,6 +119,21 @@ track, box, object cloud).
   CUDA RoPE extension (`curope`) to build. Skipping this is fine —
   CUT3R falls back to a slower pure-Python RoPE.
 - **Homebrew** on macOS (only for COLMAP).
+- **Hugging Face account with access to [`facebook/sam3`](https://huggingface.co/facebook/sam3)**
+  if you want object detection/tracking. SAM3 is a gated repo: open the
+  link, request access (one-time form, manually approved by Meta), then
+  authenticate the project venv after running `setup/00_venv.py`:
+
+  ```
+  models/.venv/bin/hf auth login     # macOS / Linux
+  models\.venv\Scripts\hf auth login # Windows
+  ```
+
+  Paste a token from <https://huggingface.co/settings/tokens> (read
+  scope is sufficient). The old `huggingface-cli login` command is
+  deprecated — use `hf auth login`. `setup/sam.py` will refuse to run
+  until the token is in place and prints the same instructions if it
+  hits a 401 / gated-repo error.
 
 Everything else — torch, all model repos, all checkpoints, COLMAP —
 lands under `models/`, which is gitignored.
@@ -364,7 +379,10 @@ below comes straight from `setup/<name>.py`.
 ### Object segmentation
 
 #### SAM3 detect — `detect_object.py`
-- **Source**: `facebook/sam3` on HF → `models/weights/sam3.pt`.
+- **Source**: [`facebook/sam3`](https://huggingface.co/facebook/sam3)
+  on HF → `models/weights/sam3.pt`. **Gated repo**: request access on
+  the model page and `huggingface-cli login` into the project venv
+  before running `setup/sam.py`. See the [Setup](#setup) section.
 - **Loaded via**: Ultralytics (`ultralytics>=8.4.37`).
 - **Inputs**: frame image, click x/y, label.
 - **Output**: `detect.json` (bbox + base64 RGBA mask) + `frame0_mask.png`.

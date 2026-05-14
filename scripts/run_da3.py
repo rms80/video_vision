@@ -27,6 +27,9 @@ import time
 import numpy as np
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
+
 
 POSE_CKPT = "depth-anything/DA3-LARGE-1.1"
 METRIC_CKPT = "depth-anything/DA3METRIC-LARGE"
@@ -84,7 +87,8 @@ def main():
 
     from depth_anything_3.api import DepthAnything3
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
+    print(f"[da3] device={device}", flush=True)
 
     # ---- Pass 1: pose model ----------------------------------------------
     print(f"[da3] Loading {POSE_CKPT} on {device}...")

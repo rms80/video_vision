@@ -23,6 +23,9 @@ import cv2
 import numpy as np
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
 CUT3R_ROOT = os.path.join(REPO_ROOT, "models", "external", "cut3r")
@@ -81,7 +84,7 @@ def main():
     from src.dust3r.utils.image import load_images
 
     # Load model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
     print(f"[cut3r] Loading model on {device}...")
     model = ARCroco3DStereo.from_pretrained(CUT3R_CKPT).to(device)
     model.eval()

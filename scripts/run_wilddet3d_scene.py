@@ -23,11 +23,15 @@ import os
 import json
 import glob
 import argparse
+import contextlib
 
 import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
 
 WILDDET3D_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "models", "external", "wilddet3d")
@@ -67,7 +71,8 @@ def main():
     frame_indices = [int(os.path.splitext(os.path.basename(f))[0]) for f in frames_to_use]
     print(f"[wilddet3d-scene] {len(frames_to_use)} frames (subsample={subsample}) at {src_w}x{src_h}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
+    print(f"[wilddet3d-scene] device={device}", flush=True)
     print(f"[wilddet3d-scene] Using device: {device}")
 
     ckpt_path = os.path.join(WILDDET3D_ROOT, "ckpt",
@@ -99,7 +104,9 @@ def main():
 
         # Run with a dummy text prompt (needed to satisfy the API; we
         # throw away detections and only use depth + K_pred).
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+        amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.float16)
+                   if device == "cuda" else contextlib.nullcontext())
+        with torch.no_grad(), amp_ctx:
             outputs = model(
                 images=data["images"].to(device),
                 intrinsics=data["intrinsics"].unsqueeze(0).to(device),

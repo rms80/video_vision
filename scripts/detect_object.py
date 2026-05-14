@@ -16,6 +16,9 @@ import torch
 from ultralytics.models.sam import SAM3SemanticPredictor
 from huggingface_hub import hf_hub_download
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WEIGHTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "models", "weights"))
 WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "sam3.pt")
@@ -37,6 +40,9 @@ def main():
         os.makedirs(WEIGHTS_DIR, exist_ok=True)
         hf_hub_download(repo_id="facebook/sam3", filename="sam3.pt", local_dir=WEIGHTS_DIR)
 
+    device = pick_device()
+    print(f"[detect] device={device}", file=sys.stderr, flush=True)
+
     predictor = SAM3SemanticPredictor(overrides=dict(
         conf=0.1,
         imgsz=1008,
@@ -45,6 +51,7 @@ def main():
         model=WEIGHTS_PATH,
         save=False,
         verbose=False,
+        device=device,
     ))
 
     predictor.set_image(image_path)

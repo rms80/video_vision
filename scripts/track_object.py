@@ -23,6 +23,9 @@ import numpy as np
 import torch
 from ultralytics.models.sam import SAM2VideoPredictor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WEIGHTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "models", "weights"))
 MODEL_NAME = "sam2.1_l.pt"
@@ -62,7 +65,7 @@ def main():
     seed_bbox = load_seed_bbox(detect_json_path)
     print(f"[track] seed bbox={seed_bbox}", flush=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
     print(f"[track] device={device} model={MODEL_NAME}", flush=True)
 
     os.makedirs(WEIGHTS_DIR, exist_ok=True)

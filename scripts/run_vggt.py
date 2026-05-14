@@ -34,6 +34,9 @@ import contextlib
 import numpy as np
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
 VGGT_ROOT = os.path.join(REPO_ROOT, "models", "external", "vggt")
@@ -117,7 +120,7 @@ class VGGTRunner:
         self._load_and_preprocess = load_and_preprocess_images
         self._pose_encoding_to_extri_intri = pose_encoding_to_extri_intri
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = pick_device()
         if self.device == "cuda":
             cap_major = torch.cuda.get_device_capability()[0]
             self.dtype = torch.bfloat16 if cap_major >= 8 else torch.float16

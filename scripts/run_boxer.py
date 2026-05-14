@@ -27,6 +27,9 @@ import os
 import json
 import argparse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
+
 import cv2
 import numpy as np
 import torch
@@ -283,12 +286,7 @@ def main():
     print(f"[boxer] World->Boxer rotation angle: {np.degrees(np.arccos(np.clip(c_val, -1, 1))):.1f} deg")
 
     # Device setup
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
+    device = pick_device()
     print(f"[boxer] Using device: {device}")
 
     # Load BoxerNet

@@ -25,6 +25,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
+
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
 
@@ -33,7 +36,8 @@ def load_model():
     from transformers import AutoImageProcessor, AutoModelForDepthEstimation
     proc = AutoImageProcessor.from_pretrained(MODEL_ID)
     model = AutoModelForDepthEstimation.from_pretrained(MODEL_ID)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
+    print(f"[depth] device={device}", flush=True)
     model = model.to(device).eval()
     return proc, model, device
 

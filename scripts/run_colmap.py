@@ -28,13 +28,19 @@ import os
 import json
 import shutil
 import argparse
+import shutil
 import subprocess
 import cv2
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
-COLMAP_BAT = os.path.join(REPO_ROOT, "models", "tools", "colmap", "COLMAP.bat")
+# Windows uses the bundled standalone build; macOS/Linux use `colmap` on PATH
+# (installed via `brew install colmap` on macOS, or distro package on Linux).
+if sys.platform == "win32":
+    COLMAP_BIN = os.path.join(REPO_ROOT, "models", "tools", "colmap", "COLMAP.bat")
+else:
+    COLMAP_BIN = shutil.which("colmap") or "colmap"
 
 
 def run(cmd, cwd=None):
@@ -86,19 +92,19 @@ def run_colmap_pipeline(scene_dir: str):
         shutil.rmtree(sparse_dir)
     os.makedirs(sparse_dir, exist_ok=True)
 
-    run([COLMAP_BAT, "feature_extractor",
+    run([COLMAP_BIN, "feature_extractor",
          "--image_path", image_dir,
          "--database_path", db_path,
          "--ImageReader.single_camera", "1",
          "--ImageReader.camera_model", "SIMPLE_RADIAL",
          "--FeatureExtraction.use_gpu", "1"])
 
-    run([COLMAP_BAT, "sequential_matcher",
+    run([COLMAP_BIN, "sequential_matcher",
          "--database_path", db_path,
          "--FeatureMatching.use_gpu", "1",
          "--SequentialMatching.overlap", "30"])
 
-    run([COLMAP_BAT, "mapper",
+    run([COLMAP_BIN, "mapper",
          "--database_path", db_path,
          "--image_path", image_dir,
          "--output_path", sparse_dir])
@@ -122,7 +128,7 @@ def run_colmap_pipeline(scene_dir: str):
         if best_dir:
             print(f"[run_colmap] running final bundle adjustment on {best_dir} "
                   f"({best_count} images)", flush=True)
-            run([COLMAP_BAT, "bundle_adjuster",
+            run([COLMAP_BIN, "bundle_adjuster",
                  "--input_path", best_dir,
                  "--output_path", best_dir,
                  "--BundleAdjustmentCeres.max_num_iterations", "200",
@@ -230,8 +236,10 @@ def main():
                     help="Skip staging + COLMAP run; only re-export cameras.json from existing sparse/")
     args = ap.parse_args()
 
-    if not os.path.exists(COLMAP_BAT):
-        print(f"COLMAP.bat not found at {COLMAP_BAT}", file=sys.stderr)
+    if not COLMAP_BIN or not os.path.exists(COLMAP_BIN):
+        hint = ("Install via `python setup/colmap.py` (brew install colmap on macOS, "
+                "standalone build on Windows)." )
+        print(f"COLMAP binary not found at {COLMAP_BIN!r}. {hint}", file=sys.stderr)
         sys.exit(1)
 
     if args.export_only:

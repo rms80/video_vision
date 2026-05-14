@@ -31,7 +31,9 @@ import time
 import types
 from pathlib import Path
 
-from _pointcloud_io import save_chunked_pointcloud
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _pointcloud_io import save_chunked_pointcloud  # noqa: E402
+from _device import pick_device  # noqa: E402
 
 # Make the HunyuanWorld-Mirror checkout importable.
 WORLDMIRROR_ROOT = Path(__file__).resolve().parent.parent / "models" / "external" / "hunyuanworld-mirror"
@@ -143,7 +145,8 @@ def main():
     print(f"[worldmirror] Working resolution: {work_W}x{work_H}")
 
     # Load model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
+    print(f"[worldmirror] device={device}", flush=True)
     print(f"[worldmirror] Loading WorldMirror on {device}...")
     from src.models.models.worldmirror import WorldMirror  # noqa: E402
     model = WorldMirror.from_pretrained("tencent/HunyuanWorld-Mirror").to(device).eval()

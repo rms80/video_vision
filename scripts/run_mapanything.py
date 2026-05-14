@@ -28,6 +28,9 @@ import time
 import cv2
 import numpy as np
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
 import torch.nn.functional as F
 
 from _pointcloud_io import save_chunked_pointcloud
@@ -98,7 +101,7 @@ def main():
         rgb_list.append(img)
 
     # Load model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
     print(f"[mapanything] Loading MapAnything on {device}...")
     from mapanything.models import MapAnything
     model = MapAnything.from_pretrained("facebook/map-anything").to(device)
@@ -107,7 +110,10 @@ def main():
     print("[mapanything] Running inference...")
     t0 = time.time()
 
-    # Check if bfloat16 flash attention works, fall back to fp16
+    # Check if bfloat16 flash attention works, fall back to fp16.
+    # On non-CUDA we disable AMP entirely — MapAnything's amp path
+    # assumes CUDA flash-attention kernels.
+    use_amp = device == "cuda"
     amp_dtype = "bf16"
     if device == "cuda":
         cap = torch.cuda.get_device_capability()
@@ -118,7 +124,7 @@ def main():
         views,
         memory_efficient_inference=True,
         minibatch_size=1,
-        use_amp=True,
+        use_amp=use_amp,
         amp_dtype=amp_dtype,
         apply_mask=True,
         mask_edges=True,

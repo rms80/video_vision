@@ -27,11 +27,16 @@ import glob
 import math
 import time
 
+import contextlib
+
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _device import pick_device  # noqa: E402
 from torchvision import transforms
 
 from _pointcloud_io import save_chunked_pointcloud
@@ -115,7 +120,7 @@ def main():
     imgs = torch.stack(imgs_list, dim=0)  # (N, 3, H, W)
 
     # Load model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
     print(f"[pi3] Loading Pi3X on {device}...")
     from pi3.models.pi3x import Pi3X
     model = Pi3X.from_pretrained("yyfz233/Pi3X").to(device).eval()
@@ -126,10 +131,12 @@ def main():
     print("[pi3] Running inference...")
     t0 = time.time()
     # Use float16 — Pi3's attention forces FLASH_ATTENTION for bfloat16 which
-    # may not be available in all torch builds.
-    with torch.no_grad():
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            res = model(imgs[None].to(device))  # (1, N, 3, H, W) -> dict
+    # may not be available in all torch builds. Skip autocast on non-CUDA
+    # (MPS/CPU run in float32 fine).
+    amp_ctx = (torch.amp.autocast("cuda", dtype=torch.float16)
+               if device == "cuda" else contextlib.nullcontext())
+    with torch.no_grad(), amp_ctx:
+        res = model(imgs[None].to(device))  # (1, N, 3, H, W) -> dict
     elapsed = time.time() - t0
     print(f"[pi3] Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
 
@@ -229,7 +236,9 @@ def main():
     scene_pts[:, 1] *= -1
     scene_pts[:, 2] *= -1
 
-    save_chunked_pointcloud(out_dir, "scene_pointmap", scene_pts, scene_rgb, scene_conf)
+    scene_manifest = save_chunked_pointcloud(
+        out_dir, "scene_pointmap", scene_pts, scene_rgb, scene_conf
+    )
     print(f"[pi3] Scene pointmap: {scene_pts.shape[0]:,} points")
 
     # ---- Write cameras.json ----
@@ -257,7 +266,7 @@ def main():
     print(f"[pi3] Wrote {cam_path}")
     print(f"[pi3] Wrote {N} depth maps to {depth_dir}")
     print(f"[pi3] Wrote {N} pointmaps to {pointmap_dir}")
-    print(f"[pi3] Wrote scene pointmap to {scene_path}")
+    print(f"[pi3] Wrote scene pointmap manifest to {scene_manifest}")
 
 
 if __name__ == "__main__":
