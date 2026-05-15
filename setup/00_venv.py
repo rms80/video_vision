@@ -33,6 +33,47 @@ BASE_DEPS = [
 ]
 
 
+def maybe_install_cuda_toolkit_linux() -> None:
+    """On Linux with an NVIDIA GPU but no nvcc, apt-get install
+    nvidia-cuda-toolkit + build-essential so CUT3R's curope CUDA
+    extension can build on a later `python setup/cut3r.py --force`.
+    No-op on Windows/macOS, no NVIDIA GPU, nvcc already present, or
+    if apt-get isn't the package manager. Best-effort: prints and
+    continues on failure rather than aborting venv setup."""
+    if sys.platform != "linux":
+        return
+    if shutil.which("nvidia-smi") is None:
+        print("[venv] no nvidia-smi on PATH; skipping CUDA toolkit install")
+        return
+    if shutil.which("nvcc") is not None:
+        print(f"[venv] nvcc already on PATH ({shutil.which('nvcc')}); "
+              "skipping CUDA toolkit install")
+        return
+    if shutil.which("apt-get") is None:
+        print("[venv] NVIDIA GPU detected but apt-get unavailable; install a "
+              "CUDA toolkit manually if you want curope-style extensions to build")
+        return
+    sudo = ["sudo"] if shutil.which("sudo") else []
+    print("[venv] NVIDIA GPU detected without nvcc; installing "
+          "nvidia-cuda-toolkit + build-essential (may prompt for sudo password)")
+    try:
+        subprocess.run([*sudo, "apt-get", "update"], check=True)
+        subprocess.run(
+            [*sudo, "apt-get", "install", "-y",
+             "nvidia-cuda-toolkit", "build-essential"],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"[venv] CUDA toolkit install failed ({e}); continuing. "
+              "CUT3R will fall back to slow Python RoPE2D.")
+        return
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        print(f"[venv] nvcc installed: {nvcc}")
+    else:
+        print("[venv] WARNING: apt-get succeeded but nvcc still not on PATH")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create the project venv.")
     parser.add_argument("--force", action="store_true",
@@ -81,6 +122,8 @@ def main() -> None:
 
     print(f"[venv] installing base deps: {', '.join(BASE_DEPS)}")
     _lib.pip_install(*BASE_DEPS)
+
+    maybe_install_cuda_toolkit_linux()
 
     print(f"[venv] done. venv python: {_lib.venv_python()}")
 
