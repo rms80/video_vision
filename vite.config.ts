@@ -385,34 +385,66 @@ function segViewerPlugin(): Plugin {
 
       // GET /api/gpu-status — current used/total GPU memory (MiB) via nvidia-smi.
       // Returns { used, total, util } or { error } if nvidia-smi is unavailable.
+      //
+      // nvidia-smi can take multiple seconds on WSL2 (interop bridge). The
+      // client polls every 2s, so without coalescing we'd accumulate
+      // concurrent nvidia-smi spawns whenever one call ran longer than the
+      // poll interval — each spawn compounds CPU on the bridge and makes
+      // the next one even slower. Two defenses:
+      //   1. In-flight coalescing: while one nvidia-smi is running, every
+      //      additional caller awaits the *same* promise. Only one process
+      //      ever runs at a time.
+      //   2. Short freshness cache: if we have a result newer than
+      //      GPU_CACHE_TTL_MS, serve it directly and skip the spawn.
+      type GpuStatus =
+        | { used: number; total: number; util: number | null }
+        | { error: string };
+      const GPU_CACHE_TTL_MS = 1500;
+      let gpuInFlight: Promise<GpuStatus> | null = null;
+      let gpuLast: { ts: number; value: GpuStatus } | null = null;
+
+      const fetchGpuStatus = (): Promise<GpuStatus> => {
+        if (gpuInFlight) return gpuInFlight;
+        if (gpuLast && Date.now() - gpuLast.ts < GPU_CACHE_TTL_MS) {
+          return Promise.resolve(gpuLast.value);
+        }
+        gpuInFlight = new Promise<GpuStatus>((resolve) => {
+          const proc = spawn("nvidia-smi", [
+            "--query-gpu=memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+          ]);
+          let out = "";
+          let settled = false;
+          const done = (value: GpuStatus) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          };
+          proc.stdout.on("data", (c: Buffer) => (out += c.toString()));
+          proc.on("error", (err) => done({ error: err.message }));
+          proc.on("close", () => {
+            const line = out.split(/\r?\n/).find((l) => l.trim()) ?? "";
+            const [u, t, g] = line.split(",").map((s) => Number(s.trim()));
+            if (!Number.isFinite(u) || !Number.isFinite(t)) {
+              done({ error: "Could not parse nvidia-smi output" });
+              return;
+            }
+            done({ used: u, total: t, util: Number.isFinite(g) ? g : null });
+          });
+        }).then((value) => {
+          gpuLast = { ts: Date.now(), value };
+          gpuInFlight = null;
+          return value;
+        });
+        return gpuInFlight;
+      };
+
       server.middlewares.use("/api/gpu-status", (req, res, next) => {
         if (req.method !== "GET") return next();
-        const proc = spawn("nvidia-smi", [
-          "--query-gpu=memory.used,memory.total,utilization.gpu",
-          "--format=csv,noheader,nounits",
-        ]);
-        let out = "";
-        let responded = false;
-        proc.stdout.on("data", (c: Buffer) => (out += c.toString()));
-        proc.on("error", (err) => {
-          if (responded) return;
-          responded = true;
-          res.statusCode = 500;
+        fetchGpuStatus().then((value) => {
           res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: err.message }));
-        });
-        proc.on("close", () => {
-          if (responded) return;
-          responded = true;
-          res.setHeader("Content-Type", "application/json");
-          const line = out.split(/\r?\n/).find((l) => l.trim()) ?? "";
-          const [u, t, g] = line.split(",").map((s) => Number(s.trim()));
-          if (!Number.isFinite(u) || !Number.isFinite(t)) {
-            res.statusCode = 500;
-            res.end(JSON.stringify({ error: "Could not parse nvidia-smi output" }));
-            return;
-          }
-          res.end(JSON.stringify({ used: u, total: t, util: Number.isFinite(g) ? g : null }));
+          if ("error" in value) res.statusCode = 500;
+          res.end(JSON.stringify(value));
         });
       });
 
