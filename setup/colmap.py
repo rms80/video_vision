@@ -2,8 +2,9 @@
 
 Windows: download the official CUDA build to models/tools/colmap/.
 macOS:   brew install colmap (Homebrew required).
+Linux:   apt-get install colmap (Debian/Ubuntu; needs sudo).
 
-Both: pip install pycolmap into the venv and verify the binary runs.
+All: pip install pycolmap into the venv and verify the binary runs.
 
 Run after 00_venv.py:
 
@@ -87,6 +88,76 @@ def install_macos(force: bool) -> Path:
     return Path(found)
 
 
+def install_linux(force: bool) -> Path:
+    have_apt = shutil.which("apt-get") is not None
+    existing = shutil.which("colmap")
+    if existing and not force:
+        print(f"[colmap] colmap already on PATH: {existing}")
+        binary = Path(existing)
+    else:
+        if not have_apt:
+            sys.exit("[colmap] no apt-get found. Install colmap via your distro's "
+                     "package manager and re-run.")
+        print("[colmap] apt-get install colmap (may prompt for sudo password)")
+        _apt_install("colmap", update=True)
+        found = shutil.which("colmap")
+        if found is None:
+            sys.exit("[colmap] colmap not on PATH after apt-get install")
+        binary = Path(found)
+
+    if have_apt:
+        _fixup_linux_shared_libs(binary)
+    return binary
+
+
+# Ubuntu 26.04 ships colmap 3.12.6-4 linked against libPoseLib.so but
+# doesn't pull libposelib in as a hard dep. Map known missing soname
+# -> apt package so we can self-heal.
+_LINUX_LIB_TO_APT_PACKAGE = {
+    "libPoseLib.so": "libposelib",
+}
+
+
+def _fixup_linux_shared_libs(binary: Path) -> None:
+    """If `binary` reports missing shared libs that we know how to install
+    via apt, install them. Silent no-op if ldd is missing or nothing is
+    broken."""
+    if shutil.which("ldd") is None:
+        return
+    result = subprocess.run(
+        ["ldd", str(binary)], capture_output=True, text=True,
+    )
+    missing = []
+    for line in (result.stdout or "").splitlines():
+        # ldd format:  "\tlibFoo.so => not found"
+        line = line.strip()
+        if "=> not found" not in line:
+            continue
+        name = line.split("=>", 1)[0].strip()
+        if name:
+            missing.append(name)
+    if not missing:
+        return
+
+    fixable = [n for n in missing if n in _LINUX_LIB_TO_APT_PACKAGE]
+    unfixable = [n for n in missing if n not in _LINUX_LIB_TO_APT_PACKAGE]
+    if fixable:
+        pkgs = sorted({_LINUX_LIB_TO_APT_PACKAGE[n] for n in fixable})
+        print(f"[colmap] colmap is missing shared libs ({', '.join(fixable)}); "
+              f"installing: {', '.join(pkgs)}")
+        _apt_install(*pkgs)
+    if unfixable:
+        print(f"[colmap] WARNING: colmap is missing shared libs with no known "
+              f"apt fix: {', '.join(unfixable)}")
+
+
+def _apt_install(*packages: str, update: bool = False) -> None:
+    sudo = ["sudo"] if shutil.which("sudo") else []
+    if update:
+        subprocess.run([*sudo, "apt-get", "update"], check=True)
+    subprocess.run([*sudo, "apt-get", "install", "-y", *packages], check=True)
+
+
 def verify(binary: Path) -> None:
     print(f"[colmap] verifying: {binary} help")
     result = subprocess.run(
@@ -109,6 +180,8 @@ def main() -> None:
         binary = install_windows(args.force)
     elif sys.platform == "darwin":
         binary = install_macos(args.force)
+    elif sys.platform == "linux":
+        binary = install_linux(args.force)
     else:
         sys.exit(f"[colmap] unsupported platform: {sys.platform}")
 

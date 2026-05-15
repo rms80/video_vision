@@ -34,6 +34,8 @@ import cv2
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+from _progress import progress  # noqa: E402
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
 # Windows uses the bundled standalone build; macOS/Linux use `colmap` on PATH
 # (installed via `brew install colmap` on macOS, or distro package on Linux).
@@ -48,6 +50,50 @@ def run(cmd, cwd=None):
     r = subprocess.run(cmd, cwd=cwd)
     if r.returncode != 0:
         raise RuntimeError(f"command failed ({r.returncode}): {' '.join(cmd)}")
+
+
+def _colmap_capabilities(binary: str):
+    """Detect COLMAP's option namespace and CUDA support.
+
+    COLMAP 4.x renamed `SiftExtraction`/`SiftMatching` to
+    `FeatureExtraction`/`FeatureMatching`. Ubuntu 26.04 ships 3.12.x
+    (Sift* names) built without CUDA; the Windows zip is 4.0.3 with
+    CUDA. Returns dict with keys: extract_ns, match_ns, has_cuda.
+    """
+    r = subprocess.run(
+        [binary, "feature_extractor", "--help"],
+        capture_output=True, text=True,
+    )
+    help_text = (r.stdout or "") + (r.stderr or "")
+    if "--FeatureExtraction.use_gpu" in help_text:
+        extract_ns, match_ns = "FeatureExtraction", "FeatureMatching"
+    else:
+        extract_ns, match_ns = "SiftExtraction", "SiftMatching"
+
+    # Bundle-adjuster namespace also changed between 3.x and 4.x
+    # (BundleAdjustment.* -> BundleAdjustmentCeres.*).
+    r2 = subprocess.run(
+        [binary, "bundle_adjuster", "--help"],
+        capture_output=True, text=True,
+    )
+    ba_help = (r2.stdout or "") + (r2.stderr or "")
+    if "--BundleAdjustmentCeres." in ba_help:
+        ba_ns = "BundleAdjustmentCeres"
+    else:
+        ba_ns = "BundleAdjustment"
+
+    if sys.platform == "win32":
+        # Our bundled Windows build is the CUDA zip.
+        has_cuda = True
+    else:
+        has_cuda = False
+        try:
+            ldd = subprocess.run(["ldd", binary], capture_output=True, text=True)
+            has_cuda = "libcudart" in (ldd.stdout or "")
+        except FileNotFoundError:
+            pass
+    return {"extract_ns": extract_ns, "match_ns": match_ns,
+            "ba_ns": ba_ns, "has_cuda": has_cuda}
 
 
 def stage_images(scene_dir: str, every: int, max_size: int):
@@ -67,6 +113,8 @@ def stage_images(scene_dir: str, every: int, max_size: int):
     work_w = int(round(src_w * scale))
     work_h = int(round(src_h * scale))
 
+    total_to_stage = len(range(0, meta["frame_count"], every))
+    progress(f"Staging {total_to_stage} images at {work_w}x{work_h}...")
     staged = []
     for idx in range(0, meta["frame_count"], every):
         name = f"{idx:06d}.jpg"
@@ -92,18 +140,27 @@ def run_colmap_pipeline(scene_dir: str):
         shutil.rmtree(sparse_dir)
     os.makedirs(sparse_dir, exist_ok=True)
 
+    caps = _colmap_capabilities(COLMAP_BIN)
+    gpu_flag = "1" if caps["has_cuda"] else "0"
+    if not caps["has_cuda"]:
+        print("[run_colmap] note: this COLMAP build has no CUDA support; "
+              "SIFT extraction + matching will run on CPU", flush=True)
+
+    progress(f"COLMAP feature extraction ({'GPU' if caps['has_cuda'] else 'CPU'} SIFT)...")
     run([COLMAP_BIN, "feature_extractor",
          "--image_path", image_dir,
          "--database_path", db_path,
          "--ImageReader.single_camera", "1",
          "--ImageReader.camera_model", "SIMPLE_RADIAL",
-         "--FeatureExtraction.use_gpu", "1"])
+         f"--{caps['extract_ns']}.use_gpu", gpu_flag])
 
+    progress("COLMAP sequential matching...")
     run([COLMAP_BIN, "sequential_matcher",
          "--database_path", db_path,
-         "--FeatureMatching.use_gpu", "1",
+         f"--{caps['match_ns']}.use_gpu", gpu_flag,
          "--SequentialMatching.overlap", "30"])
 
+    progress("COLMAP mapping (incremental SfM)...")
     run([COLMAP_BIN, "mapper",
          "--database_path", db_path,
          "--image_path", image_dir,
@@ -126,13 +183,14 @@ def run_colmap_pipeline(scene_dir: str):
             except Exception:
                 pass
         if best_dir:
+            progress(f"COLMAP bundle adjustment ({best_count} images)...")
             print(f"[run_colmap] running final bundle adjustment on {best_dir} "
                   f"({best_count} images)", flush=True)
             run([COLMAP_BIN, "bundle_adjuster",
                  "--input_path", best_dir,
                  "--output_path", best_dir,
-                 "--BundleAdjustmentCeres.max_num_iterations", "200",
-                 "--BundleAdjustmentCeres.function_tolerance", "0"])
+                 f"--{caps['ba_ns']}.max_num_iterations", "200",
+                 f"--{caps['ba_ns']}.function_tolerance", "0"])
 
 
 def export_cameras_json(scene_dir: str, staged, work_w, work_h, scale, src_w, src_h, every):
@@ -157,6 +215,7 @@ def export_cameras_json(scene_dir: str, staged, work_w, work_h, scale, src_w, sr
     reg_ids = set(rec.reg_image_ids())
     num_reg = len(reg_ids)
     num_pts = len(rec.points3D)
+    progress(f"Reconstruction: {num_reg}/{len(staged)} registered, {num_pts:,} points")
     print(f"[run_colmap] reconstruction: {num_reg}/{len(staged)} registered, "
           f"{num_pts} points", flush=True)
 
