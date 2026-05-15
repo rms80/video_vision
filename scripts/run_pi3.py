@@ -29,6 +29,11 @@ import time
 
 import contextlib
 
+# Make stdout/stderr unbuffered so prepare.log shows progress instead of
+# only the final batch dump when the process exits.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import cv2
 import numpy as np
 import torch
@@ -37,6 +42,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _device import pick_device  # noqa: E402
+from _progress import progress  # noqa: E402
 from torchvision import transforms
 
 from _pointcloud_io import save_chunked_pointcloud
@@ -108,6 +114,7 @@ def main():
     print(f"[pi3] Target resolution: {target_w}x{target_h}")
 
     # Load and preprocess images
+    progress(f"Preprocessing {N} frames to {target_w}x{target_h}...")
     to_tensor = transforms.ToTensor()
     imgs_list = []
     rgb_list = []  # Keep uint8 copies for scene_pointmap coloring
@@ -121,6 +128,7 @@ def main():
 
     # Load model
     device = pick_device()
+    progress(f"Loading Pi3X on {device}...")
     print(f"[pi3] Loading Pi3X on {device}...")
     from pi3.models.pi3x import Pi3X
     model = Pi3X.from_pretrained("yyfz233/Pi3X").to(device).eval()
@@ -128,6 +136,7 @@ def main():
     print("[pi3] Multimodal branches disabled (image-only mode)")
 
     # Run inference
+    progress(f"Running Pi3X inference on {N} frames...")
     print("[pi3] Running inference...")
     t0 = time.time()
     # Use float16 — Pi3's attention forces FLASH_ATTENTION for bfloat16 which
@@ -138,6 +147,7 @@ def main():
     with torch.no_grad(), amp_ctx:
         res = model(imgs[None].to(device))  # (1, N, 3, H, W) -> dict
     elapsed = time.time() - t0
+    progress(f"Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
     print(f"[pi3] Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
 
     # Extract outputs (remove batch dim)
@@ -177,6 +187,7 @@ def main():
     scale_factor = ((target_w / src_w) + (target_h / src_h)) / 2
 
     # ---- Write per-frame outputs ----
+    progress(f"Writing {N} depth maps + pointmaps...")
     frames_out = []
     for i in range(N):
         idx = frame_indices[i]
@@ -214,6 +225,7 @@ def main():
         )
 
     # ---- Write global scene pointmap ----
+    progress("Building scene-wide point cloud...")
     # Collect valid world-space points + RGB from all frames
     all_pts = []
     all_rgb = []

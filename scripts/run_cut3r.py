@@ -25,6 +25,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _device import pick_device  # noqa: E402
+from _progress import progress  # noqa: E402
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
@@ -85,11 +86,13 @@ def main():
 
     # Load model
     device = pick_device()
+    progress(f"Loading CUT3R on {device}...")
     print(f"[cut3r] Loading model on {device}...")
     model = ARCroco3DStereo.from_pretrained(CUT3R_CKPT).to(device)
     model.eval()
 
     # Prepare input views
+    progress(f"Preprocessing {len(frames_to_use)} frames...")
     print("[cut3r] Preparing input views...")
     images = load_images(frames_to_use, size=args.size, square_ok=True)
     views = []
@@ -115,10 +118,12 @@ def main():
         views.append(view)
 
     # Run inference
+    progress(f"Running CUT3R inference on {len(views)} frames...")
     print("[cut3r] Running inference...")
     t0 = time.time()
     outputs, _ = inference_recurrent(views, model, device)
     elapsed = time.time() - t0
+    progress(f"Inference done in {elapsed:.1f}s ({elapsed/len(views):.2f}s/frame)")
     print(f"[cut3r] Inference done in {elapsed:.1f}s "
           f"({elapsed/len(views):.2f}s/frame)")
 
@@ -157,6 +162,7 @@ def main():
     scale = (scale_x + scale_y) / 2  # approximate, CUT3R may not preserve aspect ratio
 
     # Convert to cameras.json format
+    progress(f"Writing {B} depth maps + pointmaps...")
     frames_out = []
     for i in range(B):
         idx = frame_indices[i]

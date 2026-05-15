@@ -34,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _pointcloud_io import save_chunked_pointcloud  # noqa: E402
 from _device import pick_device  # noqa: E402
+from _progress import progress  # noqa: E402
 
 # Make the HunyuanWorld-Mirror checkout importable.
 WORLDMIRROR_ROOT = Path(__file__).resolve().parent.parent / "models" / "external" / "hunyuanworld-mirror"
@@ -135,6 +136,7 @@ def main():
     # Load + preprocess images using WorldMirror's own utility (crop to target_size
     # on the short-axis workflow: width -> target_size, height rounded to /14 then
     # center-cropped to target_size if larger).
+    progress(f"Preprocessing {N} frames...")
     from src.utils.inference_utils import prepare_images_to_tensor  # noqa: E402
     imgs = prepare_images_to_tensor(
         frames_to_use,
@@ -147,6 +149,7 @@ def main():
     # Load model
     device = pick_device()
     print(f"[worldmirror] device={device}", flush=True)
+    progress(f"Loading WorldMirror on {device}...")
     print(f"[worldmirror] Loading WorldMirror on {device}...")
     from src.models.models.worldmirror import WorldMirror  # noqa: E402
     model = WorldMirror.from_pretrained("tencent/HunyuanWorld-Mirror").to(device).eval()
@@ -157,12 +160,14 @@ def main():
 
     use_amp = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    progress(f"Running WorldMirror inference on {N} frames...")
     print(f"[worldmirror] Running inference (amp={amp_dtype})...")
     t0 = time.time()
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=bool(use_amp), dtype=amp_dtype):
             predictions = model(views=views, cond_flags=cond_flags)
     elapsed = time.time() - t0
+    progress(f"Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
     print(f"[worldmirror] Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
 
     # Extract tensors (drop batch dim, move to CPU float32 for post-processing)
@@ -193,6 +198,7 @@ def main():
     scale_factor = ((work_W / src_w) + (work_H / src_h)) / 2
 
     # ---- Build filter mask (confidence percentile + depth/normal edges) ----
+    progress("Computing filter masks (depth + normal edges)...")
     print("[worldmirror] Computing filter masks...")
     valid_masks = []
     for i in range(N):
@@ -208,6 +214,7 @@ def main():
     valid_mask = np.stack(valid_masks, axis=0)  # (S, H, W) bool
 
     # ---- Write per-frame outputs ----
+    progress(f"Writing {N} depth maps + pointmaps...")
     frames_out = []
     all_world_pts = []
     all_world_rgb = []
@@ -291,7 +298,7 @@ def main():
     print(f"[worldmirror] Wrote {cam_path}")
     print(f"[worldmirror] Wrote {N} depth maps to {depth_dir}")
     print(f"[worldmirror] Wrote {N} pointmaps to {pointmap_dir}")
-    print(f"[worldmirror] Wrote scene pointmap to {scene_path}")
+    print(f"[worldmirror] Wrote scene pointmap chunks to {out_dir}")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _device import pick_device  # noqa: E402
+from _progress import progress  # noqa: E402
 
 WILDDET3D_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "models", "external", "wilddet3d")
@@ -77,6 +78,7 @@ def main():
 
     ckpt_path = os.path.join(WILDDET3D_ROOT, "ckpt",
                              "wilddet3d_alldata_all_prompt_v1.0.pt")
+    progress(f"Loading WildDet3D on {device}...")
     print(f"[wilddet3d-scene] Loading model from {ckpt_path}")
     model = build_model(
         checkpoint=ckpt_path,
@@ -92,11 +94,14 @@ def main():
     frames_out = []
     global_K = None
 
-    for frame_path, frame_idx in zip(tqdm(frames_to_use, desc="WildDet3D-scene"),
-                                      frame_indices):
+    N = len(frames_to_use)
+    for k, (frame_path, frame_idx) in enumerate(zip(tqdm(frames_to_use, desc="WildDet3D-scene"),
+                                                     frame_indices)):
         img_bgr = cv2.imread(frame_path)
         if img_bgr is None:
             continue
+        if k % 5 == 0 or k == N - 1:
+            progress(f"Per-frame depth + intrinsics: {k+1}/{N}")
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
         orig_h, orig_w = img_rgb.shape[:2]
 

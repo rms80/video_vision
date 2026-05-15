@@ -29,6 +29,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _device import pick_device  # noqa: E402
+from _progress import progress  # noqa: E402
 
 
 POSE_CKPT = "depth-anything/DA3-LARGE-1.1"
@@ -91,12 +92,16 @@ def main():
     print(f"[da3] device={device}", flush=True)
 
     # ---- Pass 1: pose model ----------------------------------------------
+    progress(f"Loading DA3 pose model on {device}...")
     print(f"[da3] Loading {POSE_CKPT} on {device}...")
     pose_model = DepthAnything3.from_pretrained(POSE_CKPT).to(device).eval()
+    progress(f"DA3 pose+depth inference on {N} frames...")
     print("[da3] Running pose+depth inference...")
     t0 = time.time()
     pose_pred = pose_model.inference(image=frames_to_use, process_res=args.process_res)
-    print(f"[da3] Pose pass {time.time() - t0:.1f}s")
+    pose_elapsed = time.time() - t0
+    progress(f"DA3 pose pass done in {pose_elapsed:.1f}s")
+    print(f"[da3] Pose pass {pose_elapsed:.1f}s")
 
     if pose_pred.extrinsics is None or pose_pred.intrinsics is None:
         print("[da3] ERROR: pose model returned no extrinsics/intrinsics", file=sys.stderr)
@@ -118,12 +123,16 @@ def main():
     free_cuda()
 
     # ---- Pass 2: metric model --------------------------------------------
+    progress(f"Loading DA3 metric model on {device}...")
     print(f"[da3] Loading {METRIC_CKPT} on {device}...")
     metric_model = DepthAnything3.from_pretrained(METRIC_CKPT).to(device).eval()
+    progress(f"DA3 metric depth inference on {N} frames...")
     print("[da3] Running metric depth inference...")
     t0 = time.time()
     metric_pred = metric_model.inference(image=frames_to_use, process_res=args.process_res)
-    print(f"[da3] Metric pass {time.time() - t0:.1f}s")
+    metric_elapsed = time.time() - t0
+    progress(f"DA3 metric pass done in {metric_elapsed:.1f}s")
+    print(f"[da3] Metric pass {metric_elapsed:.1f}s")
 
     metric_raw = metric_pred.depth.astype(np.float32)            # (N, H, W) raw net output
     if metric_raw.shape != depth_rel.shape:
@@ -173,6 +182,7 @@ def main():
     scale_factor = ((work_W / src_w) + (work_H / src_h)) / 2
 
     # ---- Write outputs ---------------------------------------------------
+    progress(f"Writing {N} depth maps + pointmaps...")
     frames_out = []
     for i in range(N):
         idx = frame_indices[i]

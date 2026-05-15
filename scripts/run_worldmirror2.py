@@ -33,6 +33,7 @@ import types
 from pathlib import Path
 
 from _pointcloud_io import save_chunked_pointcloud
+from _progress import progress
 
 # Make the HY-World-2.0 checkout importable.
 HYWORLD2_ROOT = Path(__file__).resolve().parent.parent / "models" / "external" / "hy-world-2.0"
@@ -144,6 +145,7 @@ def main():
 
     # Load pipeline — will download weights (~2.4 GB) on first use.
     from hyworld2.worldrecon.pipeline import WorldMirrorPipeline  # noqa: E402
+    progress("Loading WorldMirror 2.0 pipeline (may download weights)...")
     print("[worldmirror2] Loading WorldMirror 2.0 pipeline...")
     pipeline = WorldMirrorPipeline.from_pretrained(
         "tencent/HY-World-2.0",
@@ -151,6 +153,7 @@ def main():
     )
 
     # Run inference using the pipeline's internal helper (skips their file I/O).
+    progress(f"Running WorldMirror 2.0 inference (target_size={args.target_size})...")
     print(f"[worldmirror2] Running inference at target_size={args.target_size}...")
     t0 = time.time()
     # `_run_inference` doesn't wrap itself in no_grad, so do it here (the
@@ -160,6 +163,7 @@ def main():
             frames_to_use, args.target_size, None, None
         )
     elapsed = time.time() - t0
+    progress(f"Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
     print(f"[worldmirror2] Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
 
     B, S, C, work_H, work_W = imgs.shape
@@ -193,6 +197,7 @@ def main():
     scale_factor = ((work_W / src_w) + (work_H / src_h)) / 2
 
     # ---- Build filter mask (confidence percentile + depth/normal edges) ----
+    progress("Computing filter masks (depth + normal edges)...")
     print("[worldmirror2] Computing filter masks...")
     valid_masks = []
     for i in range(N):
@@ -208,6 +213,7 @@ def main():
     valid_mask = np.stack(valid_masks, axis=0)
 
     # ---- Write per-frame outputs ----
+    progress(f"Writing {N} depth maps + pointmaps...")
     frames_out = []
     all_world_pts = []
     all_world_rgb = []
@@ -286,7 +292,7 @@ def main():
     print(f"[worldmirror2] Wrote {cam_path}")
     print(f"[worldmirror2] Wrote {N} depth maps to {depth_dir}")
     print(f"[worldmirror2] Wrote {N} pointmaps to {pointmap_dir}")
-    print(f"[worldmirror2] Wrote scene pointmap to {scene_path}")
+    print(f"[worldmirror2] Wrote scene pointmap chunks to {out_dir}")
 
 
 if __name__ == "__main__":

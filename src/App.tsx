@@ -14,6 +14,21 @@ import {
   DEFAULT_BOX_SOLVER_ID,
 } from "./boxSolverPlugins";
 
+/** Compact human-readable duration: `0.4s`, `12s`, `1m 23s`, `1h 4m`. */
+function formatElapsed(seconds: number): string {
+  if (!isFinite(seconds) || seconds < 0) return "0s";
+  if (seconds < 1) return `${seconds.toFixed(1)}s`;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.round(seconds % 60);
+    return `${m}m ${s}s`;
+  }
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
 /** Viridis colormap (256 entries) — [r,g,b] each 0–255 */
 const VIRIDIS: [number, number, number][] = [];
 {
@@ -51,7 +66,51 @@ export default function App() {
   const [videoSize, setVideoSize] = createSignal<{ w: number; h: number } | null>(null);
   const fps = () => 30;
   const [dragOver, setDragOver] = createSignal(false);
-  const [status, setStatus] = createSignal("Drop a video file to begin");
+  const [status, setStatusRaw] = createSignal("Drop a video file to begin");
+  // Accumulated, timestamped status log. Every setStatus() call appends
+  // here (consecutive duplicates are skipped), and the "Log" button opens
+  // a popup that shows the whole history with a copy-to-clipboard action.
+  const [statusLog, setStatusLog] = createSignal<string[]>([]);
+  const [statusLogOpen, setStatusLogOpen] = createSignal(false);
+  const [statusLogCopied, setStatusLogCopied] = createSignal(false);
+  const setStatus = (msg: string) => {
+    setStatusRaw(msg);
+    setStatusLog((prev) => {
+      const ts = new Date().toLocaleTimeString();
+      const line = `[${ts}] ${msg}`;
+      // Skip exact-duplicate messages (ignoring timestamp) to keep
+      // polling progress updates from spamming the log.
+      if (prev.length > 0) {
+        const last = prev[prev.length - 1];
+        const lastMsg = last.replace(/^\[[^\]]*\]\s*/, "");
+        if (lastMsg === msg) return prev;
+      }
+      return [...prev, line];
+    });
+  };
+  const clearStatusLog = () => {
+    setStatusLog([]);
+  };
+  const copyStatusLog = async () => {
+    const text = statusLog().join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatusLogCopied(true);
+      window.setTimeout(() => setStatusLogCopied(false), 1500);
+    } catch {
+      // Fallback for environments without clipboard permission.
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch {}
+      document.body.removeChild(ta);
+      setStatusLogCopied(true);
+      window.setTimeout(() => setStatusLogCopied(false), 1500);
+    }
+  };
   const [detectLabel, setDetectLabel] = createSignal("chair");
   const [settingSeed, setSettingSeed] = createSignal(false);
   const [seedPoint, setSeedPoint] = createSignal<{ x: number; y: number } | null>(null);
@@ -66,7 +125,16 @@ export default function App() {
   } | null>(null);
   const [sceneStatus, setSceneStatus] = createSignal<{
     artifacts: Record<string, boolean>;
-    job: { pluginId?: string; stage: string; running: boolean; error: string | null; cancelled?: boolean } | null;
+    job: {
+      pluginId?: string;
+      stage: string;
+      running: boolean;
+      error: string | null;
+      cancelled?: boolean;
+      startedAt?: number;
+      finishedAt?: number;
+      progress?: string | null;
+    } | null;
   } | null>(null);
   // Which plugin (if any) we have locally initiated a prepare for. The
   // backend is authoritative via /api/scene/status.job.running, but we
@@ -162,6 +230,13 @@ export default function App() {
   // are scoped to (currentAnalysis, sceneSource).
   const [objectPointmapRunning, setObjectPointmapRunning] = createSignal(false);
   const [objectPointmapReady, setObjectPointmapReady] = createSignal(false);
+  // Mask erosion radius (depth-map pixels) applied before unprojection — peels
+  // off silhouette boundary pixels where interpolated depth produces fly-aways
+  // behind the object. Persisted across sessions.
+  const [objectErode, setObjectErode] = createSignal<string>(
+    localStorage.getItem("segviewer:objectErode") ?? "2",
+  );
+  createEffect(() => localStorage.setItem("segviewer:objectErode", objectErode()));
   // Scene-pointmap fetch status (driven by ThreeDepthViewer.onScenePointmapStatus).
   // `progress` is null until the manifest reports total bytes; `pointCount`
   // is null until the first chunk lands; chunk counters are null until the
@@ -695,10 +770,11 @@ export default function App() {
     setObjectPointmapReady(false);
     setStatus("Building object point cloud (per-frame depth ∩ mask, fused)...");
     try {
+      const erodeN = Math.max(0, Math.round(Number(objectErode())) || 0);
       const res = await fetch("/api/object-pointmap", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ video, analysis, source }),
+        body: JSON.stringify({ video, analysis, source, options: { erode: erodeN } }),
       });
       const data = await res.json();
       if (data.error) {
@@ -728,10 +804,12 @@ export default function App() {
               setObjectPointmapReady(false);
             } else {
               setObjectPointmapReady(!!s.ready);
-              const elapsed = ((s.job.finishedAt - s.job.startedAt) / 1000).toFixed(1);
-              setStatus(`Object cloud built in ${elapsed}s`);
+              const elapsed = formatElapsed((s.job.finishedAt - s.job.startedAt) / 1000);
+              setStatus(`Object cloud built in ${elapsed}`);
               setDataVersion((v) => v + 1);  // force viewer to refetch
             }
+          } else if (s.job?.running && s.job?.progress) {
+            setStatus(`Object cloud: ${s.job.progress}`);
           }
         } catch {}
       }, 2000);
@@ -976,7 +1054,10 @@ export default function App() {
           const label = data.job?.pluginId
             ? (SCENE_PLUGINS_BY_ID[data.job.pluginId]?.label ?? data.job.pluginId)
             : "Scene";
-          setStatus(`${label}: ${data.job.stage}...`);
+          // Show the live progress line from the script when we have one,
+          // otherwise fall back to the pipeline stage name.
+          const detail = data.job?.progress?.trim() || data.job.stage;
+          setStatus(`${label}: ${detail}`);
         }
         if (scenePollTimer === undefined) {
           scenePollTimer = window.setInterval(() => {
@@ -993,7 +1074,15 @@ export default function App() {
           } else if (data.job?.cancelled) {
             // cancelScene() already set a status; don't overwrite with "complete".
           } else {
-            setStatus("Scene prep complete.");
+            const label = data.job?.pluginId
+              ? (SCENE_PLUGINS_BY_ID[data.job.pluginId]?.label ?? data.job.pluginId)
+              : "Scene";
+            const elapsed = data.job?.startedAt && data.job?.finishedAt
+              ? formatElapsed((data.job.finishedAt - data.job.startedAt) / 1000)
+              : null;
+            setStatus(elapsed
+              ? `${label} complete in ${elapsed}`
+              : `${label} complete.`);
             const v = videoName();
             if (v) await refreshDepthFrames(v);
             setDataVersion((v) => v + 1);
@@ -1743,7 +1832,7 @@ export default function App() {
                   </button>
                 );
               })()}
-              <Show when={sceneStatus()?.job?.error}>
+              <Show when={sceneStatus()?.job?.error && sceneStatus()?.job?.pluginId === sceneSource()}>
                 <div style={{ "font-size": "11px", color: "#e94560", "margin-top": "4px" }}>error: {sceneStatus()!.job!.error}</div>
               </Show>
               <button
@@ -1980,6 +2069,31 @@ export default function App() {
             <div style={{ padding: "12px 16px" }}>
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
                 Object Point Cloud
+              </div>
+              <div
+                style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
+                title="Erode the per-frame mask by this many pixels at the mask's native (source) resolution, before downsampling to the depth map. Depth networks produce interpolated values right at silhouettes, so the outermost mask pixels often unproject to fly-away points behind the object; eroding peels those off. 0 = off. Bump it up if you see a wispy halo behind the cloud, but too high will shave thin features (table legs, fingers)."
+              >
+                <label style={{ "font-size": "11px", color: "#aaa" }}>Mask erode</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={objectErode()}
+                  onInput={(e) => setObjectErode(e.currentTarget.value)}
+                  disabled={objectPointmapRunning()}
+                  style={{
+                    width: "60px",
+                    padding: "4px 6px",
+                    background: "#0a0e1a",
+                    border: "1px solid #0f3460",
+                    color: "#e0e0e0",
+                    "border-radius": "3px",
+                    "font-size": "12px",
+                    "font-family": "inherit",
+                  }}
+                />
+                <span style={{ "font-size": "11px", color: "#888" }}>px</span>
               </div>
               {(() => {
                 const enabled = () =>
@@ -2563,21 +2677,41 @@ export default function App() {
         "min-height": "0",
       }}>
         <div style={{ flex: "1", display: "flex", "flex-direction": "column", gap: "4px", "min-height": "0" }}>
-          <div
-            style={{
-              flex: "1",
-              padding: "8px",
-              background: "#0a0e1a",
-              border: "1px solid #0f3460",
-              "border-radius": "4px",
-              "font-size": "12px",
-              color: "#888",
-              "min-height": "36px",
-              "overflow-y": "auto",
-              "white-space": "pre-wrap",
-            }}
-          >
-            {status()}
+          <div style={{ flex: "1", display: "flex", gap: "6px", "align-items": "stretch", "min-height": "0" }}>
+            <div
+              style={{
+                flex: "1",
+                padding: "8px",
+                background: "#0a0e1a",
+                border: "1px solid #0f3460",
+                "border-radius": "4px",
+                "font-size": "12px",
+                color: "#888",
+                "min-height": "36px",
+                "overflow-y": "auto",
+                "white-space": "pre-wrap",
+              }}
+            >
+              {status()}
+            </div>
+            <button
+              type="button"
+              onClick={() => setStatusLogOpen(true)}
+              title="Open full status log"
+              style={{
+                padding: "6px 12px",
+                background: "#0f3460",
+                color: "#e2e2e2",
+                border: "1px solid #1f5fa0",
+                "border-radius": "4px",
+                "font-size": "12px",
+                cursor: "pointer",
+                "white-space": "nowrap",
+                "align-self": "stretch",
+              }}
+            >
+              Log ({statusLog().length})
+            </button>
           </div>
           {(() => {
             const g = gpuStatus();
@@ -2616,6 +2750,121 @@ export default function App() {
         </div>
       </div>
       </div>
+
+      {/* ── Status log popup ── */}
+      <Show when={statusLogOpen()}>
+        <div
+          onClick={() => setStatusLogOpen(false)}
+          style={{
+            position: "fixed",
+            inset: "0",
+            background: "rgba(0,0,0,0.6)",
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "center",
+            "z-index": "1000",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "min(900px, 90vw)",
+              height: "min(700px, 85vh)",
+              background: "#16213e",
+              border: "1px solid #0f3460",
+              "border-radius": "6px",
+              display: "flex",
+              "flex-direction": "column",
+              overflow: "hidden",
+            }}
+          >
+            <div style={{
+              display: "flex",
+              "align-items": "center",
+              "justify-content": "space-between",
+              padding: "10px 14px",
+              "border-bottom": "1px solid #0f3460",
+              background: "#1a2547",
+            }}>
+              <div style={{ "font-size": "14px", "font-weight": "600", color: "#e2e2e2" }}>
+                Status log <span style={{ color: "#888", "font-weight": "400" }}>({statusLog().length} entries)</span>
+              </div>
+              <div style={{ display: "flex", gap: "6px" }}>
+                <button
+                  type="button"
+                  onClick={copyStatusLog}
+                  disabled={statusLog().length === 0}
+                  style={{
+                    padding: "5px 12px",
+                    background: statusLogCopied() ? "#2ecc71" : "#0f3460",
+                    color: "#e2e2e2",
+                    border: "1px solid #1f5fa0",
+                    "border-radius": "4px",
+                    "font-size": "12px",
+                    cursor: statusLog().length === 0 ? "not-allowed" : "pointer",
+                    opacity: statusLog().length === 0 ? "0.5" : "1",
+                  }}
+                >
+                  {statusLogCopied() ? "Copied!" : "Copy"}
+                </button>
+                <button
+                  type="button"
+                  onClick={clearStatusLog}
+                  disabled={statusLog().length === 0}
+                  title="Clear log"
+                  style={{
+                    padding: "5px 12px",
+                    background: "#0f3460",
+                    color: "#e2e2e2",
+                    border: "1px solid #1f5fa0",
+                    "border-radius": "4px",
+                    "font-size": "12px",
+                    cursor: statusLog().length === 0 ? "not-allowed" : "pointer",
+                    opacity: statusLog().length === 0 ? "0.5" : "1",
+                  }}
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setStatusLogOpen(false)}
+                  style={{
+                    padding: "5px 12px",
+                    background: "#0f3460",
+                    color: "#e2e2e2",
+                    border: "1px solid #1f5fa0",
+                    "border-radius": "4px",
+                    "font-size": "12px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            <div style={{
+              flex: "1",
+              overflow: "auto",
+              padding: "10px 14px",
+              background: "#0a0e1a",
+              "font-family": "ui-monospace, SFMono-Regular, Menlo, monospace",
+              "font-size": "12px",
+              color: "#cfd6e4",
+              "white-space": "pre-wrap",
+              "word-break": "break-word",
+            }}>
+              <Show
+                when={statusLog().length > 0}
+                fallback={<div style={{ color: "#666", "font-style": "italic" }}>No status messages yet.</div>}
+              >
+                <For each={statusLog()}>
+                  {(line) => <div>{line}</div>}
+                </For>
+              </Show>
+            </div>
+          </div>
+        </div>
+      </Show>
     </div>
   );
 }

@@ -27,6 +27,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _device import pick_device  # noqa: E402
+from _progress import progress  # noqa: E402
 
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
@@ -34,9 +35,10 @@ MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
 
 def load_model():
     from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+    device = pick_device()
+    progress(f"Loading DepthAnythingV2 on {device}...")
     proc = AutoImageProcessor.from_pretrained(MODEL_ID)
     model = AutoModelForDepthEstimation.from_pretrained(MODEL_ID)
-    device = pick_device()
     print(f"[depth] device={device}", flush=True)
     model = model.to(device).eval()
     return proc, model, device
@@ -158,6 +160,7 @@ def main():
             "rmse": rmse,
         })
         if k % 10 == 0 or k == len(frames) - 1:
+            progress(f"Depth + scale align: frame {k+1}/{len(frames)}")
             print(f"[run_depth] {k+1}/{len(frames)} {name} a={a:.4g} b={b:.4g} "
                   f"inl={int(inl_mask.sum())}/{int(mask.sum())} rmse={rmse:.4g}", flush=True)
 
@@ -178,6 +181,7 @@ def main():
     print(f"[run_depth] rescaled cameras.json to metric units (meters)", flush=True)
 
     # --- Pass 2: save DA2 metric depth directly (no affine alignment needed) ---
+    progress(f"Writing {len(frames)} depth maps...")
     for f in frames:
         name = f["name"]
         if name not in raw_depths:

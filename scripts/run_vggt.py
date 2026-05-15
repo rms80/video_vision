@@ -36,6 +36,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _device import pick_device  # noqa: E402
+from _progress import progress  # noqa: E402
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
@@ -126,6 +127,7 @@ class VGGTRunner:
             self.dtype = torch.bfloat16 if cap_major >= 8 else torch.float16
         else:
             self.dtype = torch.float32
+        progress(f"Loading VGGT on {self.device} ({self.dtype})...")
         print(f"[vggt] Loading {checkpoint} on {self.device} ({self.dtype})...")
         self.model = VGGT.from_pretrained(checkpoint).to(self.device)
         self.model.eval()
@@ -180,6 +182,7 @@ def run_windowed_phase1(runner: VGGTRunner, paths: list[str],
 
     for wi, window in enumerate(windows):
         window_paths = [paths[i] for i in window]
+        progress(f"VGGT phase 1: anchor window {wi+1}/{len(windows)} ({len(window)} frames)")
         print(f"[vggt] phase1 window {wi+1}/{len(windows)}: anchors "
               f"{window[0]}..{window[-1]} (count={len(window)})")
         out = runner.run(window_paths)
@@ -315,6 +318,7 @@ def main():
     # ----- Phase 1: anchors ------------------------------------------------
     anchor_paths = [frames_to_use[p] for p in anchor_positions]
     if len(anchor_paths) <= args.batch_size:
+        progress(f"VGGT phase 1: single pass over {len(anchor_paths)} anchors")
         print(f"[vggt] phase1: single pass over {len(anchor_paths)} anchors")
         out = runner.run(anchor_paths)
         print(f"[vggt]   inference {out['elapsed']:.1f}s "
@@ -359,6 +363,8 @@ def main():
         batch_positions = sorted(set(anchor_positions) | set(interior_positions))
         batch_paths = [frames_to_use[p] for p in batch_positions]
         pos_to_batch_idx = {p: i for i, p in enumerate(batch_positions)}
+        progress(f"VGGT phase 2: span {si+1}/{len(anchor_positions)-1} "
+                 f"({len(interior_positions)} interior frames)")
         print(f"[vggt] phase2 span {si+1}/{len(anchor_positions)-1}: "
               f"interior {a_pos+1}..{b_pos-1} ({len(interior_positions)} frames), "
               f"batch size {len(batch_paths)}")
@@ -404,6 +410,7 @@ def main():
           f"{len(emitted_positions) - len(anchor_positions)} interior)")
 
     # ----- Write outputs ---------------------------------------------------
+    progress(f"Writing {len(emitted_positions)} depth maps + pointmaps...")
     K_stack = np.stack([frame_intr[p] for p in emitted_positions], axis=0)
     median_K = np.median(K_stack, axis=0)
     fx, fy = float(median_K[0, 0]), float(median_K[1, 1])

@@ -31,6 +31,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _device import pick_device  # noqa: E402
+from _progress import progress  # noqa: E402
 import torch.nn.functional as F
 
 from _pointcloud_io import save_chunked_pointcloud
@@ -86,6 +87,7 @@ def main():
     # Load images using MapAnything's utility
     from mapanything.utils.image import load_images
 
+    progress(f"Preprocessing {N} frames...")
     print("[mapanything] Loading and preprocessing images...")
     views = load_images(
         frames_to_use,
@@ -102,11 +104,13 @@ def main():
 
     # Load model
     device = pick_device()
+    progress(f"Loading MapAnything on {device}...")
     print(f"[mapanything] Loading MapAnything on {device}...")
     from mapanything.models import MapAnything
     model = MapAnything.from_pretrained("facebook/map-anything").to(device)
 
     # Run inference with memory-efficient settings for 12GB GPU
+    progress(f"Running MapAnything inference on {N} frames...")
     print("[mapanything] Running inference...")
     t0 = time.time()
 
@@ -131,6 +135,7 @@ def main():
         edge_depth_threshold=DEPTH_EDGE_RTOL,
     )
     elapsed = time.time() - t0
+    progress(f"Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
     print(f"[mapanything] Inference done in {elapsed:.1f}s ({elapsed / N:.2f}s/frame)")
 
     del model
@@ -159,6 +164,7 @@ def main():
     scale_factor = ((work_W / src_w) + (work_H / src_h)) / 2
 
     # ---- Write per-frame outputs ----
+    progress(f"Writing {N} depth maps + pointmaps...")
     frames_out = []
     all_world_pts = []
     all_world_rgb = []
@@ -223,7 +229,9 @@ def main():
     scene_pts[:, 1] *= -1
     scene_pts[:, 2] *= -1
 
-    save_chunked_pointcloud(out_dir, "scene_pointmap", scene_pts, scene_rgb, scene_conf)
+    scene_manifest = save_chunked_pointcloud(
+        out_dir, "scene_pointmap", scene_pts, scene_rgb, scene_conf
+    )
     print(f"[mapanything] Scene pointmap: {scene_pts.shape[0]:,} points")
 
     # ---- Write cameras.json ----
@@ -252,7 +260,7 @@ def main():
     print(f"[mapanything] Wrote {cam_path}")
     print(f"[mapanything] Wrote {N} depth maps to {depth_dir}")
     print(f"[mapanything] Wrote {N} pointmaps to {pointmap_dir}")
-    print(f"[mapanything] Wrote scene pointmap to {scene_path}")
+    print(f"[mapanything] Wrote scene pointmap manifest to {scene_manifest}")
 
 
 if __name__ == "__main__":

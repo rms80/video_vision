@@ -38,6 +38,9 @@ type SceneJobState = {
   error: string | null;
   cancelled?: boolean;
   startedAt: number;
+  finishedAt?: number;
+  // Last `[progress] ...` line printed by the currently-running script.
+  progress?: string | null;
 };
 const sceneJobs = new Map<string, SceneJobState>(); // key: video filename
 // Tracks the *currently executing* python subprocess for a scene-prep job so
@@ -52,6 +55,7 @@ type ObjectPointmapJobState = {
   startedAt: number;
   finishedAt?: number;
   error: string | null;
+  progress?: string | null;
 };
 // key: `${video}::${analysis}::${source}` — one job per (analysis, source) pair
 const objectPointmapJobs = new Map<string, ObjectPointmapJobState>();
@@ -223,12 +227,25 @@ function sourceFlagArgs(plugin: ScenePlugin): string[] {
   return plugin.sourceFlag ? ["--source", plugin.sourceFlag] : [];
 }
 
+// Lines prefixed with this marker are surfaced live to the UI status bar
+// (see scripts/_progress.py). The marker is stripped before the message
+// is stored on job state, but the full line is still written to the log.
+const PROGRESS_PREFIX = "[progress] ";
+const PROGRESS_PREFIX_BUF = Buffer.from(PROGRESS_PREFIX, "utf8");
+// Cap on the trailing partial-line buffer. A real progress line is short
+// (well under 1 KiB); if a chunk arrives without a newline and the tail
+// grows past this, drop the oldest bytes. Protects against tqdm-style
+// `\r`-only progress bars or any other unterminated stdout from
+// accumulating unboundedly across a long-running job.
+const PROGRESS_TAIL_CAP = 64 * 1024;
+
 function runPython(
   script: string,
   args: string[],
   logPath: string,
   pythonExe: string = VENV_PYTHON,
   onSpawn?: (proc: ChildProcess) => void,
+  onProgress?: (msg: string) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const fd = fs.openSync(logPath, "a");
@@ -255,7 +272,48 @@ function runPython(
     delete cleanEnv.PYTHONSTARTUP;
     const py = spawn(pythonExe, [script, ...args], { stdio: ["ignore", "pipe", "pipe"], env: cleanEnv });
     onSpawn?.(py);
-    py.stdout.on("data", (c: Buffer) => { try { fs.writeSync(fd, c); } catch {} });
+    // Stdout: write every byte to the log fd verbatim. If onProgress is
+    // wired, *also* scan for newline-delimited `[progress] ...` lines —
+    // but on raw Buffers, without decoding the whole chunk or doing
+    // string concat. Decoding only happens for lines that actually start
+    // with the marker, which keeps verbose scripts cheap on the Node
+    // side. The trailing partial-line buffer is capped (PROGRESS_TAIL_CAP)
+    // so a chunk without `\n` (e.g. a tqdm `\r` bar) can't grow forever.
+    let progressTail: Buffer = Buffer.alloc(0);
+    py.stdout.on("data", (c: Buffer) => {
+      try { fs.writeSync(fd, c); } catch {}
+      if (!onProgress) return;
+      // Concat the leftover partial line with the new chunk. `progressTail`
+      // is typically a small subarray view from the previous chunk, so
+      // this concat is bounded.
+      const buf = progressTail.length === 0 ? c : Buffer.concat([progressTail, c]);
+      let cursor = 0;
+      while (true) {
+        const nl = buf.indexOf(0x0a, cursor); // '\n'
+        if (nl < 0) break;
+        // Line bytes are [cursor, lineEnd); strip trailing '\r' if any.
+        const lineEnd = nl > cursor && buf[nl - 1] === 0x0d ? nl - 1 : nl;
+        const lineLen = lineEnd - cursor;
+        if (lineLen >= PROGRESS_PREFIX_BUF.length &&
+            buf.compare(
+              PROGRESS_PREFIX_BUF, 0, PROGRESS_PREFIX_BUF.length,
+              cursor, cursor + PROGRESS_PREFIX_BUF.length,
+            ) === 0) {
+          onProgress(buf.toString("utf8",
+            cursor + PROGRESS_PREFIX_BUF.length, lineEnd));
+        }
+        cursor = nl + 1;
+      }
+      if (cursor >= buf.length) {
+        progressTail = Buffer.alloc(0);
+      } else if (buf.length - cursor > PROGRESS_TAIL_CAP) {
+        // Trailing partial line is longer than any plausible progress
+        // line — drop the oldest bytes so we don't accumulate forever.
+        progressTail = buf.subarray(buf.length - PROGRESS_TAIL_CAP);
+      } else {
+        progressTail = buf.subarray(cursor);
+      }
+    });
     py.stderr.on("data", (c: Buffer) => { try { fs.writeSync(fd, c); } catch {} });
     py.on("close", (code) => finish(() => {
       if (code === 0) resolve();
@@ -539,6 +597,7 @@ function segViewerPlugin(): Plugin {
               running: true,
               error: null,
               startedAt: Date.now(),
+              progress: null,
             };
             sceneJobs.set(video, state);
             res.setHeader("Content-Type", "application/json");
@@ -548,6 +607,9 @@ function segViewerPlugin(): Plugin {
               try {
                 for (const step of pipeline) {
                   state.stage = step.stage;
+                  // Clear stale progress so the UI doesn't show the previous
+                  // stage's last line while the new one is starting up.
+                  state.progress = null;
                   const args = step.args.map((a) =>
                     a === "$VIDEO" ? videoPath : a === "$SCENE" ? sd : a,
                   );
@@ -574,6 +636,7 @@ function segViewerPlugin(): Plugin {
                         stepJob = { proc, killed: false };
                         sceneActiveJobs.set(video, stepJob);
                       },
+                      (msg) => { state.progress = msg; },
                     );
                   } catch (err) {
                     // If cancelJob set killed=true on this step's job, surface
@@ -597,6 +660,8 @@ function segViewerPlugin(): Plugin {
                 }
               } finally {
                 state.running = false;
+                state.finishedAt = Date.now();
+                state.progress = null;
                 sceneActiveJobs.delete(video);
               }
             })();
@@ -1309,7 +1374,7 @@ function segViewerPlugin(): Plugin {
         req.on("data", (c: Buffer) => (body += c.toString()));
         req.on("end", () => {
           try {
-            const { video, analysis, source } = JSON.parse(body);
+            const { video, analysis, source, options = {} } = JSON.parse(body);
             if (!video || !analysis) {
               res.statusCode = 400;
               res.setHeader("Content-Type", "application/json");
@@ -1368,6 +1433,7 @@ function segViewerPlugin(): Plugin {
               source: plugin.id,
               startedAt: Date.now(),
               error: null,
+              progress: null,
             };
             objectPointmapJobs.set(jobKey, state);
 
@@ -1378,19 +1444,30 @@ function segViewerPlugin(): Plugin {
               "--depth-dir", plugin.depthDir,
               "--out", outPath,
             ];
-            console.log(`[object-pointmap] running on ${video} (${analysis}) source=${plugin.id}`);
+            // Mask erosion (depth-map space) — peels off boundary pixels
+            // where interpolated depth would produce fly-aways behind the
+            // object. 0 = off; UI defaults to 1.
+            const erode = Number(options?.erode);
+            if (Number.isFinite(erode) && erode > 0) {
+              pyArgs.push("--erode", String(Math.max(0, Math.round(erode))));
+            }
+            console.log(`[object-pointmap] running on ${video} (${analysis}) source=${plugin.id}`
+              + (erode > 0 ? ` erode=${erode}px` : ""));
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify({ ok: true, state }));
 
-            runPython(scriptPath, pyArgs, logPath)
+            runPython(scriptPath, pyArgs, logPath, undefined, undefined,
+              (msg) => { state.progress = msg; })
               .then(() => {
                 state.running = false;
                 state.finishedAt = Date.now();
+                state.progress = null;
                 console.log(`[object-pointmap] done: ${outPath}`);
               })
               .catch((err) => {
                 state.running = false;
                 state.finishedAt = Date.now();
+                state.progress = null;
                 state.error = err?.message ?? String(err);
                 console.error(`[object-pointmap] failed: ${state.error}`);
               });

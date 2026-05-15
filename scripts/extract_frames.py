@@ -12,6 +12,9 @@ import os
 import json
 import cv2
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _progress import progress  # noqa: E402
+
 
 def main():
     if len(sys.argv) < 3:
@@ -23,6 +26,7 @@ def main():
     frames_dir = os.path.join(scene_dir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
 
+    progress(f"Opening {os.path.basename(video_path)}...")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Failed to open video: {video_path}", file=sys.stderr)
@@ -31,6 +35,7 @@ def main():
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
     idx = 0
     jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, 92]
@@ -42,6 +47,10 @@ def main():
         cv2.imwrite(out_path, frame, jpeg_params)
         if idx % 50 == 0:
             print(f"[extract_frames] wrote frame {idx}", flush=True)
+            if total > 0:
+                progress(f"Extracting frames: {idx}/{total}")
+            else:
+                progress(f"Extracting frames: {idx}")
         idx += 1
     cap.release()
 
@@ -55,6 +64,7 @@ def main():
     with open(os.path.join(scene_dir, "frames.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
+    progress(f"Extracted {idx} frames at {width}x{height}")
     print(f"[extract_frames] done: {idx} frames, {width}x{height} @ {fps:.2f}fps", flush=True)
 
 
