@@ -265,7 +265,18 @@ function runPython(
     // its own venv. A stale VIRTUAL_ENV / PYTHONHOME from the launching
     // shell can otherwise cause STATUS_DLL_INIT_FAILED (0xC0000142) on
     // Windows when the wrong pythonXY.dll is found first.
-    const cleanEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONIOENCODING: "utf-8" };
+    // Force HF cache to be treated as offline-only at runtime: setup scripts
+    // populated the cache, the runner just needs to read it. This avoids a
+    // Windows-specific `socket.getaddrinfo` access violation seen on some
+    // machines when transformers/huggingface_hub does its HEAD-revalidate
+    // call. Safe because every model the runners use is preloaded by the
+    // matching setup/plugin_*.py script.
+    const cleanEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PYTHONIOENCODING: "utf-8",
+      HF_HUB_OFFLINE: "1",
+      TRANSFORMERS_OFFLINE: "1",
+    };
     delete cleanEnv.VIRTUAL_ENV;
     delete cleanEnv.PYTHONHOME;
     delete cleanEnv.PYTHONPATH;
@@ -360,7 +371,15 @@ function isAvailable(a: AvailabilitySpec | undefined): boolean {
     if (!fs.existsSync(path.resolve(__dirname, p))) return false;
   }
   for (const cmd of a.commands ?? []) {
-    if (!existsOnPath(cmd)) return false;
+    if (existsOnPath(cmd)) continue;
+    // Windows: setup scripts install bundled standalone builds under
+    // models/tools/<cmd>/ (e.g. models/tools/colmap/COLMAP.bat). The
+    // runner scripts resolve those paths directly without touching PATH.
+    if (process.platform === "win32") {
+      const bundled = path.resolve(__dirname, "models", "tools", cmd);
+      if (fs.existsSync(bundled)) continue;
+    }
+    return false;
   }
   if (a.hfRepos?.length) {
     const cache = hfCacheRoot();
