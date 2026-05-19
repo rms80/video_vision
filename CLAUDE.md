@@ -42,12 +42,15 @@ All setup files live in `setup/` and follow the same shape:
 - `patches/` — unified-diff patches applied to cloned upstream repos
   via `apply_patch()`.
 - One script per model/tool:
-  - **Scene plugins**: `colmap.py`, `depthanythingv2.py`, `cut3r.py`,
-    `vggt.py`, `da3.py`, `pi3.py`, `mapanything.py`, `worldmirror.py`,
-    `worldmirror2.py`, `wilddet3d.py`.
-  - **Box solvers**: `boxer.py`, `wilddet3d.py` (same script provides
-    both the scene + box-solver plugin).
-  - **Object seg**: `sam.py` (SAM2 + SAM3 weights).
+  - **Scene plugins**: `plugin_colmap.py`, `plugin_depthanythingv2.py`,
+    `plugin_cut3r.py`, `plugin_vggt.py`, `plugin_da3.py`,
+    `plugin_pi3.py`, `plugin_mapanything.py`, `plugin_worldmirror.py`,
+    `plugin_worldmirror2.py`, `plugin_wilddet3d.py`.
+  - **Box solvers**: `plugin_boxer.py`, `plugin_wilddet3d.py` (same
+    script provides both the scene + box-solver plugin).
+  - **Object seg**: `plugin_sam.py` (SAM2 + SAM3 weights).
+- `EVERYTHING.py` — runs `00_venv.py` then every `plugin_*.py` in
+  order. Forwards `--force` to each.
 
 Each script is **idempotent** (skips already-installed artifacts) and
 supports `--force` to wipe and reinstall. `colmap.py` branches by OS:

@@ -2,7 +2,7 @@
 
 Run after 00_venv.py:
 
-    python setup/depthanythingv2.py
+    python setup/plugin_depthanythingv2.py
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
 Run after 00_venv.py:
 
-    python setup/cut3r.py
+    python setup/plugin_cut3r.py
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def main() -> None:
                 f"          {CKPT_DRIVE_URL}\n"
                 f"        and save it to:\n"
                 f"          {ckpt_path}\n"
-                "        Then re-run `python setup/cut3r.py` to finish setup."
+                "        Then re-run `python setup/plugin_cut3r.py` to finish setup."
             )
 
     req = cut3r_dir / "requirements.txt"

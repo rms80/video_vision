@@ -8,7 +8,7 @@ Notes:
 
 Run after 00_venv.py:
 
-    python setup/worldmirror.py
+    python setup/plugin_worldmirror.py
 """
 
 from __future__ import annotations

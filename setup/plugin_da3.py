@@ -2,7 +2,7 @@
 
 Run after 00_venv.py:
 
-    python setup/da3.py
+    python setup/plugin_da3.py
 """
 
 from __future__ import annotations

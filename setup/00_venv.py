@@ -36,7 +36,7 @@ BASE_DEPS = [
 def maybe_install_cuda_toolkit_linux() -> None:
     """On Linux with an NVIDIA GPU but no nvcc, apt-get install
     nvidia-cuda-toolkit + build-essential so CUT3R's curope CUDA
-    extension can build on a later `python setup/cut3r.py --force`.
+    extension can build on a later `python setup/plugin_cut3r.py --force`.
     No-op on Windows/macOS, no NVIDIA GPU, nvcc already present, or
     if apt-get isn't the package manager. Best-effort: prints and
     continues on failure rather than aborting venv setup."""

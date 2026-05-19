@@ -2,7 +2,7 @@
 
 Run after 00_venv.py:
 
-    python setup/vggt.py
+    python setup/plugin_vggt.py
 """
 
 from __future__ import annotations

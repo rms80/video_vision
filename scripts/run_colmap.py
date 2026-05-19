@@ -296,7 +296,7 @@ def main():
     args = ap.parse_args()
 
     if not COLMAP_BIN or not os.path.exists(COLMAP_BIN):
-        hint = ("Install via `python setup/colmap.py` (brew install colmap on macOS, "
+        hint = ("Install via `python setup/plugin_colmap.py` (brew install colmap on macOS, "
                 "standalone build on Windows)." )
         print(f"COLMAP binary not found at {COLMAP_BIN!r}. {hint}", file=sys.stderr)
         sys.exit(1)

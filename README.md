@@ -1,10 +1,15 @@
 # video_vision
 
-A browser-based workbench for turning a single hand-held video into 3D:
-camera poses + per-frame depth, then per-object 2D segmentation, 3D
-bounding boxes, and dense object point clouds. The UI is a Solid + Three
+A browser-based workbench for experimenting with ML/Vision models for video processing. You can run various models on an uploaded video to:
+
+* Generate camera pose + intrinsics + depth
+* 2D object segmentation / tracking
+* 3D bounding box 
+* Scene & Object point clouds
+
+The UI is a Solid + Three
 app served by Vite; all heavy lifting is done by Python scripts that the
-Vite dev server shells out to.
+Vite dev server shells out to. A plugin architecture makes it easy to add additional models.
 
 The repo bundles a Python `setup/` toolchain that installs every model
 into a single, gitignored `models/` directory: one venv, one set of
@@ -18,49 +23,39 @@ The typical end-to-end run looks like this. Every step writes its outputs
 to `analysis/<video_stem>/` and shows up in the right viewport without
 needing a refresh.
 
-1. **Upload a video.** Drag-drop or pick from the sidebar selector.
-   The server re-encodes for smooth scrubbing (half-second keyframes)
+1. **Upload a video.** Drag-drop or pick a previosly-uploaded video.
+   The server re-encodes for smooth scrubbing 
    and pre-extracts every frame as a JPEG under
-   `analysis/<video>/_scene/frames/`. Scene plugins consume those
-   frames, not the raw video.
+   `analysis/<video>/_scene/frames/`. 
 
-2. **Scene analysis** (sidebar: *3D Scene Analysis*). Pick a
+2. **Scene analysis**. Pick a
    reconstruction method (COLMAP, CUT3R, VGGT, DA3, Pi3, MapAnything,
-   WorldMirror, WorldMirror 2.0, or WildDet3D) and hit prepare. The
-   chosen plugin produces per-frame camera poses + intrinsics +
-   per-frame depth, and (for most neural plugins) per-frame and/or
-   global pointmaps. Several plugins accept a "subsample every N
-   frames" hint to trade quality for speed.
+   WorldMirror 1.0 / 2.0) and run. Produces camera poses + intrinsics +
+   per-frame depth, and (for most plugins) per-frame and/or
+   global pointmaps.
 
-3. **World-up annotation** (optional, sidebar: *Annotation*). Click 3+
+3. **World-up annotation** (optional). Click 3+
    points on horizontal surfaces (floor, table) across one or more
    frames, then *Align Scene*. This rotates the reconstruction so up is
    `+y`, yaws frame 0 to look down `+z`, and translates frame 0 to the
    origin. Stored per-video; reusable across analyses.
 
-4. **Object segmentation.** Click any object in the source frame.
-   - `detect_object.py` runs SAM3 click-to-segment and writes
-     `detect.json` (bbox + base64 RGBA mask) + a frame-0 PNG mask.
-   - `track_object.py` then propagates the bbox through every frame
-     with SAM2 video tracking, writing `track.json` and per-frame
-     `masks/NNNNNN.png`.
+4. **Object segmentation.** Click any object in the source frame, and enter a text label. SAM3 is run to segment the first frame (writes `detect.json` (bbox + base64 RGBA mask) + a frame-0 PNG mask). Then SAM2 can be run to propagate tracking (writes `track.json` and per-frame `masks/NNNNNN.png`).  *Note: the click is used to disambiguate which segmentation result to track*
 
-   Each detect-then-track pair lives in its own analysis folder named
-   `<label>_<N>` (e.g. `chair_1`), so a video can carry many parallel
-   object analyses.
+   Each detect-then-track pair lives in its own analysis folder `<label>_<N>` (e.g. `chair_1`), selectable from the UI. 
 
-5. **Box solve** (sidebar: *Object Box*). Lift the tracked 2D mask
+5. **Box solve** Lift the tracked 2D mask
    into a 3D oriented bounding box. Two solvers:
    - **Boxer** (default): per-frame OBB from masked depth/pointmap.
      The *Fuse* toggle merges all frames' point clouds into one shared
      static box (more stable, slower).
-   - **WildDet3D**: neural 3D detector with optional intrinsics-prior
+   - **WildDet3D**: neural 3D detector with optional camera-intrinsics-prior
      and depth-prior toggles.
 
    Output: `<analysis>/<solver>/boxes.json`. Solvers can co-exist on
    one analysis run (output dirs are keyed by solver id).
 
-6. **Object point cloud** (sidebar: *3D (Object)*). Builds a dense
+6. **Object point cloud** . Builds a dense
    object-only point cloud by unprojecting per-frame depth through the
    per-frame mask and concatenating across the tracked range. Streamed
    to the viewer as chunked `.npz` blobs.
@@ -70,34 +65,20 @@ needing a refresh.
 ## Right viewport: the five tabs
 
 The right side of the UI is a tab strip + viewport. Tabs are
-keyboard-navigable; arrow keys step frames within a tab (or jump to the
-nearest frame that has data for that view).
+keyboard-navigable; arrow keys step frames within a tab (or jump to the nearest keyframe).
 
 - **Source** — the raw video frame, overlaid with the current mask /
-  bbox if an analysis is loaded. Click here to spawn a new detection;
-  this is also the surface for world-up point picking when
-  *Set World-Up Points* is active.
+  bbox if an analysis is loaded. 
 
-- **Depth** — the active scene plugin's per-frame depth map, colourised
-  and aligned to the source frame's resolution.
+- **Depth** — the active scene plugin's per-frame depth map, colourised and aligned to the source frame's resolution.
 
 - **3D (Per-Frame)** — Three.js viewport showing the current frame's
-  depth lifted into 3D, plus the camera frustum and (optionally) the
-  full camera path. A *Pointmap* toggle (only for plugins that publish
-  per-frame pointmaps: CUT3R, VGGT, DA3, Pi3, MapAnything,
-  WorldMirror, WorldMirror2) swaps the meshed depth for the plugin's
-  raw pointmap. A `1/1 · 1/2 · 1/4` stride control lets you trade
-  density for FPS. *Focus* snaps to the current camera; *Reset* fits
-  the whole scene.
+  depth lifted into a 3D mesh, plus camera path/frustums, solved boxes, etc
 
-- **3D (Scene)** — global scene pointmap streamed in chunks. Only
-  available for plugins that publish a scene-wide pointmap (Pi3,
-  MapAnything, WorldMirror, WorldMirror2). Solved 3D boxes from the
-  active solver are overlaid here.
+- **3D (Scene)** — global scene pointmap streamed in chunks (plus boxes / etc)
 
 - **3D (Object)** — object-only point cloud built by unprojecting depth
-  through the tracked masks. Streams in chunks; a small download
-  indicator in the bottom-right shows progress.
+  through the tracked masks. 
 
 Status / log output appears in a fixed bar at the bottom of the
 viewport and follows the latest pipeline run (scene prep, detect,
@@ -131,7 +112,7 @@ track, box, object cloud).
 
   Paste a token from <https://huggingface.co/settings/tokens> (read
   scope is sufficient). The old `huggingface-cli login` command is
-  deprecated — use `hf auth login`. `setup/sam.py` will refuse to run
+  deprecated — use `hf auth login`. `setup/plugin_sam.py` will refuse to run
   until the token is in place and prints the same instructions if it
   hits a 401 / gated-repo error.
 
@@ -142,47 +123,50 @@ lands under `models/`, which is gitignored.
 
 ```
 npm install
-python setup/all.py
+python setup/EVERYTHING.py
 ```
 
-`setup/all.py` is a thin convenience wrapper that runs the individual
-scripts in order. Each script is **idempotent**: it skips already-
-present artifacts and only re-does work when invoked with `--force`.
-Re-running `all.py` is safe.
+`setup/EVERYTHING.py` runs
+`00_venv.py` first and then every `plugin_*.py` in order. Each script
+is **idempotent**: it skips already-present artifacts and only re-does
+work when invoked with `--force`. Re-running `EVERYTHING.py` is safe.
 
 ### Per-component install
 
 If you only need a subset of the plugins, install them piecewise:
 
 ```
-python setup/00_venv.py             # always first
-python setup/colmap.py              # if you want the COLMAP plugin
-python setup/depthanythingv2.py     # paired with COLMAP
-python setup/cut3r.py
-python setup/vggt.py
-python setup/da3.py
-python setup/pi3.py
-python setup/mapanything.py
-python setup/worldmirror.py
-python setup/worldmirror2.py
-python setup/wilddet3d.py           # provides scene AND box solver
-python setup/boxer.py
-python setup/sam.py                 # required for detect/track
+python setup/00_venv.py                    # always first
+python setup/plugin_colmap.py              # if you want the COLMAP plugin
+python setup/plugin_depthanythingv2.py     # paired with COLMAP
+python setup/plugin_cut3r.py
+python setup/plugin_vggt.py
+python setup/plugin_da3.py
+python setup/plugin_pi3.py
+python setup/plugin_mapanything.py
+python setup/plugin_worldmirror.py
+python setup/plugin_worldmirror2.py
+python setup/plugin_wilddet3d.py           # provides scene AND box solver
+python setup/plugin_boxer.py
+python setup/plugin_sam.py                 # required for detect/track
 ```
 
 Every script supports `--force` to wipe its artifact and reinstall.
 
 ### Running the app
 
+**Windows**: 
+```
+run_server.bat
+```
+
+**OSX / Linux**:  
 ```
 bash run_server.sh
 ```
 
-The Vite dev server listens on **port 4444** (`strictPort: true`, so a
-stale listener will fail the start — that's why we use the restart
-script). The dev-server middleware shells out to
-`models/.venv/Scripts/python.exe` (or `models/.venv/bin/python` on
-Unix) for every pipeline call.
+The Vite dev server listens on **port 4444**. The scripts above will kill and restart the server if it's already running. Change this in the scripts if you want a different port.
+
 
 ### Directory layout after install
 
@@ -234,7 +218,7 @@ below comes straight from `setup/<name>.py`.
 - **Checkpoint**: `cut3r_512_dpt_4_64.pth` fetched from CUT3R's Google
   Drive via `gdown` (Drive throttling occasionally needs a manual
   download; the script prints the URL and bails gracefully if so).
-- **Custom modifications applied by `setup/cut3r.py`**:
+- **Custom modifications applied by `setup/plugin_cut3r.py`**:
   - Filters CUT3R's `requirements.txt` to skip its pinned `torch /
     torchvision / numpy / pillow` (we keep the CUDA-built torch from
     the base venv).
@@ -265,7 +249,7 @@ below comes straight from `setup/<name>.py`.
 - **HF models**: `depth-anything/DA3-LARGE-1.1` (pose + relative depth)
   and `depth-anything/DA3METRIC-LARGE` (metric depth). A scene-wide
   ratio reconciles the two so translations land in meters.
-- **Custom modifications applied by `setup/da3.py`** (DA3's upstream
+- **Custom modifications applied by `setup/plugin_da3.py`** (DA3's upstream
   requirements are not Python 3.13-friendly):
   - Skips `open3d` (no 3.13 wheel on PyPI; only viz paths use it),
     `xformers` (latest hard-requires torch >= 2.10 and would clobber
@@ -320,7 +304,7 @@ below comes straight from `setup/<name>.py`.
   recursively (submodules `third_party/sam3` and `third_party/lingbot_depth`).
 - **Checkpoint**: `wilddet3d_alldata_all_prompt_v1.0.pt` from
   `allenai/WildDet3D` on HF.
-- **Custom modifications applied by `setup/wilddet3d.py`** (this one's
+- **Custom modifications applied by `setup/plugin_wilddet3d.py`** (this one's
   the worst — upstream requirements are heavily incompatible with
   Python 3.13):
   - `utils3d` in upstream `requirements.txt` resolves to the wrong PyPI
@@ -382,7 +366,7 @@ below comes straight from `setup/<name>.py`.
 - **Source**: [`facebook/sam3`](https://huggingface.co/facebook/sam3)
   on HF → `models/weights/sam3.pt`. **Gated repo**: request access on
   the model page and `huggingface-cli login` into the project venv
-  before running `setup/sam.py`. See the [Setup](#setup) section.
+  before running `setup/plugin_sam.py`. See the [Setup](#setup) section.
 - **Loaded via**: Ultralytics (`ultralytics>=8.4.37`).
 - **Inputs**: frame image, click x/y, label.
 - **Output**: `detect.json` (bbox + base64 RGBA mask) + `frame0_mask.png`.
@@ -424,9 +408,3 @@ Adding a new scene method is a single entry in
 `src/scenePlugins.ts` plus one runner script under `scripts/`. Adding
 a new box solver is the same shape but in `src/boxSolverPlugins.ts`.
 
----
-
-## Notes
-
-- Anything under `models/`, `uploads/`, `analysis/`, `tmp/`, and `*.pt`
-  is gitignored.

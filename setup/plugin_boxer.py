@@ -11,7 +11,7 @@ Notes:
 
 Run after 00_venv.py:
 
-    python setup/boxer.py
+    python setup/plugin_boxer.py
 """
 
 from __future__ import annotations

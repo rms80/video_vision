@@ -7,7 +7,7 @@ Used by scripts/track_object.py (SAM2) and scripts/detect_object.py (SAM3).
 
 Run after 00_venv.py:
 
-    python setup/sam.py
+    python setup/plugin_sam.py
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def _print_sam3_auth_help() -> None:
     print("      command is deprecated — use `hf auth login` instead.)")
     print()
     print("  4. Re-run this script:")
-    print("       python setup/sam.py")
+    print("       python setup/plugin_sam.py")
     print()
     print(bar)
 

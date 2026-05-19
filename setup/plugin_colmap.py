@@ -8,7 +8,7 @@ All: pip install pycolmap into the venv and verify the binary runs.
 
 Run after 00_venv.py:
 
-    python setup/colmap.py
+    python setup/plugin_colmap.py
 """
 
 from __future__ import annotations
