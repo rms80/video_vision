@@ -11,9 +11,12 @@ Notes:
       paths to sys.path so the `sam3` and `mdm` packages import without
       pip-install.
     - The runner builds the model with `skip_pretrained=True`, which
-      means SAM3 / LingBot pretrained weights are *not* needed — the
-      WildDet3D checkpoint already contains them. So we only fetch
-      `wilddet3d_alldata_all_prompt_v1.0.pt`.
+      skips *loading* the SAM3 / LingBot pretrained weights (the WildDet3D
+      checkpoint already contains them). But LingBot's config is read
+      from `model.pt` of `robbyant/lingbot-depth-postrain-dc-vitl14`, so
+      that file still has to be cached locally — otherwise inference.py
+      hits `hf_hub_download` at runtime, which crashes the runner once
+      the dev server sets `HF_HUB_OFFLINE=1`. We pre-cache it here.
     - Pinned torch / torchvision / numpy / pillow are filtered out of
       the requirements install so we keep the venv's CUDA torch build.
     - `utils3d` in requirements.txt resolves to the wrong PyPI package
@@ -30,7 +33,7 @@ Notes:
 
 Run after 00_venv.py:
 
-    python setup/wilddet3d.py
+    python setup/plugin_wilddet3d.py
 """
 
 from __future__ import annotations
@@ -47,6 +50,12 @@ REPO_URL = "https://github.com/allenai/WildDet3D.git"
 COMMIT = "1768ffcd4c5e9bb1856d3f1a5b0b5e0498b89c97"
 HF_REPO = "allenai/WildDet3D"
 CKPT_NAME = "wilddet3d_alldata_all_prompt_v1.0.pt"
+
+# LingBot-Depth backbone: even with skip_pretrained=True the runner reads
+# `model_config` from this file's checkpoint, so it must be in the HF cache
+# for the offline-mode runtime to find it.
+LINGBOT_HF_REPO = "robbyant/lingbot-depth-postrain-dc-vitl14"
+LINGBOT_FILE = "model.pt"
 
 UTILS3D_URL = "git+https://github.com/EasternJournalist/utils3d.git@94d1037aabbce32dea9c07a7c4849525817a1615"
 
@@ -117,6 +126,12 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"[wilddet3d] caching {CKPT_NAME} from {HF_REPO} into {ckpt_dir}")
     _lib.hf_snapshot(HF_REPO, allow_patterns=[CKPT_NAME], local_dir=ckpt_dir)
+
+    # Populate the hub cache (no local_dir) so the runtime
+    # `hf_hub_download(repo_id=LINGBOT_HF_REPO, filename=LINGBOT_FILE)` call
+    # resolves from cache under HF_HUB_OFFLINE=1.
+    print(f"[wilddet3d] caching {LINGBOT_FILE} from {LINGBOT_HF_REPO} into HF cache")
+    _lib.hf_snapshot(LINGBOT_HF_REPO, allow_patterns=[LINGBOT_FILE])
 
     print("[wilddet3d] done")
 
