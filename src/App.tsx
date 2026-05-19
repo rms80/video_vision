@@ -14,6 +14,9 @@ import {
   DEFAULT_BOX_SOLVER_ID,
 } from "./boxSolverPlugins";
 
+/** Show the active scene-analysis plugin name overlaid on the right viewport. */
+const SHOW_SCENE_NAME_OVERLAY = true;
+
 /** Compact human-readable duration: `0.4s`, `12s`, `1m 23s`, `1h 4m`. */
 function formatElapsed(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) return "0s";
@@ -159,7 +162,7 @@ export default function App() {
     const set = availableBoxSolverIds();
     return set ? BOX_SOLVER_PLUGINS.filter((p) => set.has(p.id)) : BOX_SOLVER_PLUGINS;
   };
-  const SAM_INSTALL_HINT = "Run `python setup/sam.py` from the project root to download the weights, then refresh.";
+  const SAM_INSTALL_HINT = "Run `python setup/plugin_sam.py` from the project root to download the weights, then refresh.";
   const sam2DisabledReason = () => sam2Available() ? null
     : `SAM2 weights not installed (expected models/weights/sam2.1_l.pt). ${SAM_INSTALL_HINT}`;
   const sam3DisabledReason = () => sam3Available() ? null
@@ -1483,18 +1486,14 @@ export default function App() {
   } as const;
 
   const headerStyle = {
-    padding: "12px 16px",
-    display: "flex",
-    "align-items": "center",
-    "justify-content": "space-between",
+    display: "block",
     "border-bottom": "1px solid #0f3460",
   } as const;
 
-  const titleStyle = {
-    "font-size": "14px",
-    "font-weight": "700",
-    "letter-spacing": "0.5px",
-    color: "#e94560",
+  const logoStyle = {
+    display: "block",
+    width: "100%",
+    height: "auto",
   } as const;
 
   const btnStyle = (active = true) => ({
@@ -1541,7 +1540,7 @@ export default function App() {
       {/* ── Sidebar (full window height) ── */}
       <div style={sidebarStyle}>
           <div style={headerStyle}>
-            <span style={titleStyle}>VideoVision</span>
+            <img src="/logo.png" alt="VideoVision" style={logoStyle} />
           </div>
 
           <div style={{ "overflow-y": "auto", flex: "1", padding: "0" }}>
@@ -2037,7 +2036,7 @@ export default function App() {
                 };
                 const tip = () => {
                   if (availableBoxSolvers().length === 0) {
-                    return "No 3D-box solver is installed. Run `python setup/boxer.py` (or `setup/wilddet3d.py`) to enable this.";
+                    return "No 3D-box solver is installed. Run `python setup/plugin_boxer.py` (or `setup/plugin_wilddet3d.py`) to enable this.";
                   }
                   if (boxRunning()) return `Click to cancel ${solver().label}`;
                   if (!trackData()) return "Run tracking first";
@@ -2589,6 +2588,28 @@ export default function App() {
                   </Show>
                 );
               })()}
+              {/* Active scene-analysis plugin name overlay (all tabs except Source) */}
+              <Show when={SHOW_SCENE_NAME_OVERLAY && viewTab() !== "source"}>
+                <div
+                  style={{
+                    position: "absolute",
+                    right: "20px",
+                    bottom: "16px",
+                    color: "rgba(255, 255, 255, 0.22)",
+                    "font-size": "72px",
+                    "font-weight": "700",
+                    "font-family": "inherit",
+                    "letter-spacing": "0.02em",
+                    "line-height": "1",
+                    "text-shadow": "0 2px 12px rgba(0, 0, 0, 0.5)",
+                    "pointer-events": "none",
+                    "user-select": "none",
+                    "z-index": "10",
+                  }}
+                >
+                  {getScenePluginOrDefault(sceneSource()).label}
+                </div>
+              </Show>
               {/* Drop overlay when dragging over video */}
               <Show when={dragOver()}>
                 <div
