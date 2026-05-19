@@ -4,10 +4,9 @@
 set -euo pipefail
 
 PORT=4444
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SEGVIEWER_DIR="$(dirname "$SCRIPT_DIR")"
+VIDEOVISION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "[restart-dev] checking port $PORT..."
+echo "[run-server] checking port $PORT..."
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
@@ -22,14 +21,14 @@ esac
 
 if [[ -n "${PIDS:-}" ]]; then
   for pid in $PIDS; do
-    echo "[restart-dev] killing PID $pid on port $PORT"
+    echo "[run-server] killing PID $pid on port $PORT"
     "${KILL_CMD[@]}" "$pid" >/dev/null 2>&1 || true
   done
   sleep 1
 else
-  echo "[restart-dev] port $PORT is free"
+  echo "[run-server] port $PORT is free"
 fi
 
-cd "$SEGVIEWER_DIR"
-echo "[restart-dev] starting vite dev server in $SEGVIEWER_DIR"
+cd "$VIDEOVISION_DIR"
+echo "[run-server] starting vite dev server in $VIDEOVISION_DIR"
 exec npm run dev

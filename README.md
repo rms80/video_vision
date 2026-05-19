@@ -175,7 +175,7 @@ Every script supports `--force` to wipe its artifact and reinstall.
 ### Running the app
 
 ```
-bash scripts/restart-dev.sh
+bash run_server.sh
 ```
 
 The Vite dev server listens on **port 4444** (`strictPort: true`, so a
