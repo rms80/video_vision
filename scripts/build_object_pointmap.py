@@ -12,7 +12,7 @@ manifest so the viewer can stream the cloud and render progressively.
 
 Usage:
     python build_object_pointmap.py <scene_dir> <analysis_dir> \
-        --source <plugin_id> --depth-dir <plugin/depth> --out OUT.npz
+        --cameras-dir <plugin/cameras> --depth-dir <plugin/depth> --out OUT.npz
 """
 
 import argparse
@@ -78,9 +78,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("scene_dir", type=Path)
     ap.add_argument("analysis_dir", type=Path)
-    ap.add_argument("--source", required=True, help="Scene plugin id (matches camerasDir)")
+    ap.add_argument("--cameras-dir", required=True,
+                    help="Scene-relative dir holding cameras.json (e.g. 'pi3')")
     ap.add_argument("--depth-dir", required=True,
-                    help="Depth subdir under scene_dir (e.g. 'pi3/depth')")
+                    help="Scene-relative dir holding per-frame depth NPZs (e.g. 'pi3/depth')")
     ap.add_argument("--out", type=Path, required=True, help="Output .npz path")
     ap.add_argument("--erode", type=int, default=0,
                     help="Erode the mask by N pixels at the mask's native "
@@ -89,7 +90,7 @@ def main() -> None:
                          "depth produces fly-aways. Default 0 (off).")
     args = ap.parse_args()
 
-    cameras_path = args.scene_dir / args.source / "cameras.json"
+    cameras_path = args.scene_dir / args.cameras_dir / "cameras.json"
     if not cameras_path.exists():
         raise SystemExit(f"cameras.json not found: {cameras_path}")
     cams = json.loads(cameras_path.read_text())

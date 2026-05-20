@@ -1,4 +1,4 @@
-import { createSignal, createEffect, For, Show, onMount, onCleanup, Switch, Match } from "solid-js";
+import { createSignal, createEffect, createMemo, For, Show, onMount, onCleanup, Switch, Match } from "solid-js";
 import { parseNpz } from "./npz";
 import type { CamerasJson } from "./depthMesh";
 import ThreeDepthViewer, { type BoxerResult } from "./ThreeDepthViewer";
@@ -408,20 +408,101 @@ export default function App() {
     }
   });
 
-  // VGGT target total-frame count (shown only when VGGT is selected).
-  // Sent to the backend as --num-frames; the backend picks exactly that
-  // many evenly-spaced anchors. After a run, sync the input from
-  // num_registered so switching to an existing analysis shows what was
-  // computed; reset to 15 when no VGGT analysis exists for the video.
-  const [vggtNumFrames, setVggtNumFrames] = createSignal<string>("15");
+  // Per-plugin target-frame count, keyed by plugin id. Sent to the backend
+  // as --num-frames; the runner picks exactly that many evenly-spaced
+  // frames. After a run, sync the input from num_registered so switching
+  // to an existing analysis shows what was computed; reset to the plugin's
+  // targetFramesDefault when no analysis exists for the video.
+  const [pluginTargetFrames, setPluginTargetFrames] = createSignal<Record<string, string>>(
+    Object.fromEntries(
+      SCENE_PLUGINS
+        .filter((p) => p.targetFramesDefault !== undefined)
+        .map((p) => [p.id, String(p.targetFramesDefault)]),
+    ),
+  );
+  // Per-plugin output-resolution multiplier, keyed by plugin id. Initialized
+  // from each plugin's upscaleDefault; overwritten by cameras.json `upscale`
+  // when the active source's analysis is loaded. Stored as a stringified
+  // number so the <select>'s value/option comparison stays exact.
+  const [pluginUpscales, setPluginUpscales] = createSignal<Record<string, string>>(
+    Object.fromEntries(
+      SCENE_PLUGINS
+        .filter((p) => p.upscaleDefault !== undefined)
+        .map((p) => [p.id, String(p.upscaleDefault)]),
+    ),
+  );
   createEffect(() => {
-    if (sceneSource() !== "vggt") return;
-    const cam = cameras();
-    if (cam && typeof cam.num_registered === "number" && cam.num_registered > 0) {
-      setVggtNumFrames(String(cam.num_registered));
-    } else {
-      setVggtNumFrames("15");
+    const id = sceneSource();
+    const plugin = SCENE_PLUGINS_BY_ID[id];
+    if (!plugin || plugin.upscaleDefault === undefined) return;
+    const cam = cameras() as { upscale?: number } | null;
+    const u = cam?.upscale;
+    if (typeof u === "number" && u > 0) {
+      setPluginUpscales((prev) => ({ ...prev, [id]: String(u) }));
     }
+  });
+  createEffect(() => {
+    const id = sceneSource();
+    const plugin = SCENE_PLUGINS_BY_ID[id];
+    if (!plugin || plugin.targetFramesDefault === undefined) return;
+    const cam = cameras();
+    const next = (cam && typeof cam.num_registered === "number" && cam.num_registered > 0)
+      ? String(cam.num_registered)
+      : String(plugin.targetFramesDefault);
+    setPluginTargetFrames((prev) => ({ ...prev, [id]: next }));
+  });
+
+  // For plugins with requiresCameraSource (e.g. InfiniDepth): the list of
+  // ready upstream plugins fetched from /api/scene/camera-sources, plus the
+  // user's per-plugin choice. Refreshed whenever the active video, the
+  // active plugin, or the artifact map changes (so a new upstream finishing
+  // adds itself to the list automatically).
+  const [cameraSourceOptions, setCameraSourceOptions] = createSignal<
+    { id: string; label: string }[]
+  >([]);
+  // The user's *explicit* dropdown pick per plugin. Only written from the
+  // dropdown's onChange — nothing else touches it, so clicking Run can't
+  // clobber it. Keyed by `${video}:${pluginId}` so a pick on video A doesn't
+  // leak into video B.
+  const [pluginCameraSources, setPluginCameraSources] = createSignal<Record<string, string>>({});
+  // What's recorded in self's cameras.json (per video+plugin), as reported by
+  // /api/scene/camera-sources. This is what was actually used by the last run.
+  const [cameraSourceOnDisk, setCameraSourceOnDisk] = createSignal<Record<string, string | null>>({});
+  createEffect(() => {
+    const v = videoName();
+    const id = sceneSource();
+    const plugin = SCENE_PLUGINS_BY_ID[id];
+    // Re-evaluate whenever the artifact map shifts (something upstream finishes).
+    sceneStatus()?.artifacts;
+    if (!v || !plugin?.requiresCameraSource) {
+      setCameraSourceOptions([]);
+      return;
+    }
+    fetch(`/api/scene/camera-sources?video=${encodeURIComponent(v)}&self=${id}`)
+      .then((r) => r.json())
+      .then((data) => {
+        const opts: { id: string; label: string }[] = data?.sources ?? [];
+        setCameraSourceOptions(opts);
+        const cs: string | null = data?.currentSource ?? null;
+        setCameraSourceOnDisk((prev) => ({ ...prev, [`${v}:${id}`]: cs }));
+      })
+      .catch(() => setCameraSourceOptions([]));
+  });
+  // Effective camera-source selection: prefer the user's explicit pick (if it
+  // still exists), else what's recorded on disk (the last run's source), else
+  // the first ready option. The dropdown displays this, and runScenePlugin
+  // submits it. Clicking Run never writes to `pluginCameraSources`, so the
+  // value can't change just by clicking Run.
+  const effectiveCameraSource = createMemo(() => {
+    const v = videoName();
+    const id = sceneSource();
+    if (!v) return "";
+    const opts = cameraSourceOptions();
+    const userPick = pluginCameraSources()[`${v}:${id}`];
+    if (userPick && opts.some((o) => o.id === userPick)) return userPick;
+    const onDisk = cameraSourceOnDisk()[`${v}:${id}`];
+    if (onDisk && opts.some((o) => o.id === onDisk)) return onDisk;
+    return opts[0]?.id ?? "";
   });
   // Fall back from "3D (Scene)" tab when switching to a plugin that doesn't support it
   createEffect(() => {
@@ -1142,9 +1223,22 @@ export default function App() {
         const n = Math.max(1, Math.round(Number(pluginSubsamples()[pluginId])));
         if (Number.isFinite(n)) options.subsample = n;
       }
-      if (pluginId === "vggt") {
-        const n = Math.max(1, Math.round(Number(vggtNumFrames())));
+      if (plugin.targetFramesDefault !== undefined) {
+        const n = Math.max(1, Math.round(Number(pluginTargetFrames()[pluginId])));
         if (Number.isFinite(n)) options.numFrames = n;
+      }
+      if (plugin.upscaleDefault !== undefined) {
+        const u = Number(pluginUpscales()[pluginId]);
+        if (Number.isFinite(u) && u > 0) options.upscale = u;
+      }
+      if (plugin.requiresCameraSource) {
+        const src = effectiveCameraSource();
+        if (!src) {
+          setStatus(`${plugin.label}: pick a camera source first`);
+          setPreparingPluginId(null);
+          return;
+        }
+        options.cameraSource = src;
       }
       const res = await fetch("/api/scene/prepare", {
         method: "POST",
@@ -1738,6 +1832,45 @@ export default function App() {
                   </For>
                 </Show>
               </select>
+              <Show when={SCENE_PLUGINS_BY_ID[sceneSource()]?.requiresCameraSource}>
+                <div
+                  style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
+                  title="Which scene plugin's cameras.json supplies the per-frame poses and intrinsics fed into this plugin. Only plugins with an existing analysis for this video show up here — run one of them first."
+                >
+                  <label style={{ "font-size": "11px", color: "#aaa" }}>Camera source</label>
+                  <select
+                    value={effectiveCameraSource()}
+                    disabled={cameraSourceOptions().length === 0}
+                    onChange={(e) => {
+                      const id = sceneSource();
+                      const v = videoName();
+                      const val = e.currentTarget.value;
+                      if (!v) return;
+                      setPluginCameraSources((prev) => ({ ...prev, [`${v}:${id}`]: val }));
+                    }}
+                    style={{
+                      flex: "1",
+                      padding: "4px 6px",
+                      background: "#0a0e1a",
+                      border: "1px solid #0f3460",
+                      color: "#e0e0e0",
+                      "border-radius": "3px",
+                      "font-size": "12px",
+                      "font-family": "inherit",
+                      cursor: cameraSourceOptions().length === 0 ? "not-allowed" : "pointer",
+                    }}
+                  >
+                    <Show
+                      when={cameraSourceOptions().length > 0}
+                      fallback={<option value="">(run another plugin first)</option>}
+                    >
+                      <For each={cameraSourceOptions()}>
+                        {(o) => <option value={o.id}>{o.label}</option>}
+                      </For>
+                    </Show>
+                  </select>
+                </div>
+              </Show>
               <Show when={SCENE_PLUGINS_BY_ID[sceneSource()]?.subsampleDefault !== undefined}>
                 <div
                   style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
@@ -1768,18 +1901,52 @@ export default function App() {
                   <span style={{ "font-size": "11px", color: "#888" }}>frames</span>
                 </div>
               </Show>
-              <Show when={sceneSource() === "vggt"}>
+              <Show when={SCENE_PLUGINS_BY_ID[sceneSource()]?.upscaleOptions}>
                 <div
                   style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
-                  title="VGGT processes a fixed total number of anchor frames sampled evenly across the video (independent of subsample). Higher = better coverage / longer trajectory, but more VRAM."
+                  title="Multiplier on the encoder's input resolution for the decoded depth. 1x = native; >1 super-resolves the depth via the implicit field (sharper edges, more VRAM, slower)."
+                >
+                  <label style={{ "font-size": "11px", color: "#aaa" }}>Upscale</label>
+                  <select
+                    value={pluginUpscales()[sceneSource()] ?? ""}
+                    onChange={(e) => {
+                      const id = sceneSource();
+                      const v = e.currentTarget.value;
+                      setPluginUpscales((prev) => ({ ...prev, [id]: v }));
+                    }}
+                    style={{
+                      padding: "4px 6px",
+                      background: "#0a0e1a",
+                      border: "1px solid #0f3460",
+                      color: "#e0e0e0",
+                      "border-radius": "3px",
+                      "font-size": "12px",
+                      "font-family": "inherit",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <For each={SCENE_PLUGINS_BY_ID[sceneSource()]?.upscaleOptions ?? []}>
+                      {(u) => <option value={String(u)}>{u}x</option>}
+                    </For>
+                  </select>
+                </div>
+              </Show>
+              <Show when={SCENE_PLUGINS_BY_ID[sceneSource()]?.targetFramesDefault !== undefined}>
+                <div
+                  style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
+                  title="Process exactly N frames, evenly spaced across the video. Higher = better coverage / longer trajectory, but more VRAM."
                 >
                   <label style={{ "font-size": "11px", color: "#aaa" }}>Target frames</label>
                   <input
                     type="number"
                     min="1"
                     step="1"
-                    value={vggtNumFrames()}
-                    onInput={(e) => setVggtNumFrames(e.currentTarget.value)}
+                    value={pluginTargetFrames()[sceneSource()] ?? ""}
+                    onInput={(e) => {
+                      const id = sceneSource();
+                      const v = e.currentTarget.value;
+                      setPluginTargetFrames((prev) => ({ ...prev, [id]: v }));
+                    }}
                     style={{
                       width: "60px",
                       padding: "4px 6px",
@@ -1808,15 +1975,22 @@ export default function App() {
                     : "Running...";
                 };
                 const [hovered, setHovered] = createSignal(false);
+                // Plugins that consume another plugin's cameras.json (e.g.
+                // InfiniDepth) can't run until at least one upstream source
+                // is ready.
+                const needsCameraSource = () =>
+                  Boolean(SCENE_PLUGINS_BY_ID[sceneSource()]?.requiresCameraSource);
+                const cameraSourceMissing = () =>
+                  needsCameraSource() && !effectiveCameraSource();
                 return (
                   <button
                     style={isRunning()
                       ? { ...cancellableRunningStyle(), width: "100%" }
-                      : { ...accentBtnStyle(!!videoSrc() && availablePlugins().length > 0, isReady()), width: "100%" }}
+                      : { ...accentBtnStyle(!!videoSrc() && availablePlugins().length > 0 && !cameraSourceMissing(), isReady()), width: "100%" }}
                     onMouseEnter={() => setHovered(true)}
                     onMouseLeave={() => setHovered(false)}
                     onClick={() => (isRunning() ? cancelScene() : runScenePlugin(sceneSource()))}
-                    disabled={!videoSrc() || availablePlugins().length === 0}
+                    disabled={!videoSrc() || availablePlugins().length === 0 || cameraSourceMissing()}
                     title={isRunning()
                       ? "Click to cancel the running scene-prep pipeline"
                       : isReady()

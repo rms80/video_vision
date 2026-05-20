@@ -2,13 +2,13 @@
 
 Usage:
     python run_wilddet3d.py <scene_dir> <analysis_dir> --out-dir <out_dir> \
-        [--label LABEL] [--source colmap|cut3r] [--use-intrinsics] [--use-depth]
-        [--thresh3d 0.3]
+        [--label LABEL] [--cameras-dir DIR] [--depth-dir DIR]
+        [--use-intrinsics] [--use-depth] [--thresh3d 0.3]
 
 Reads:
-    <scene_dir>/<source>/cameras.json  — camera intrinsics + per-frame poses
-    <scene_dir>/<depth_dir>/*.npz      — per-frame depth maps (if --use-depth)
-    <analysis_dir>/track.json         — per-frame 2D bboxes from SAM2 tracking
+    <scene_dir>/<cameras_dir>/cameras.json  — camera intrinsics + per-frame poses
+    <scene_dir>/<depth_dir>/*.npz           — per-frame depth maps (if --use-depth)
+    <analysis_dir>/track.json               — per-frame 2D bboxes from SAM2 tracking
 
 Outputs:
     <out_dir>/boxes.json              — per-frame 3D oriented bounding boxes
@@ -41,8 +41,8 @@ from wilddet3d.inference import build_model
 from wilddet3d.preprocessing import preprocess
 
 
-def load_cameras(scene_dir: str, source: str = "colmap") -> dict:
-    cam_path = os.path.join(scene_dir, source, "cameras.json")
+def load_cameras(scene_dir: str, cameras_dir: str) -> dict:
+    cam_path = os.path.join(scene_dir, cameras_dir, "cameras.json")
     with open(cam_path) as f:
         return json.load(f)
 
@@ -53,27 +53,9 @@ def load_track(analysis_dir: str) -> dict:
         return json.load(f)
 
 
-def load_depth(scene_dir: str, frame_idx: int, source: str = "colmap") -> np.ndarray | None:
-    """Load an aligned depth .npz, returning float32 (H, W) or None."""
-    if source == "cut3r":
-        depth_subdir = "cut3r/depth"
-    elif source == "wilddet3d":
-        depth_subdir = "wilddet3d/depth"
-    elif source == "vggt":
-        depth_subdir = "vggt/depth"
-    elif source == "da3":
-        depth_subdir = "da3/depth"
-    elif source == "pi3":
-        depth_subdir = "pi3/depth"
-    elif source == "mapanything":
-        depth_subdir = "mapanything/depth"
-    elif source == "worldmirror":
-        depth_subdir = "worldmirror/depth"
-    elif source == "worldmirror2":
-        depth_subdir = "worldmirror2/depth"
-    else:
-        depth_subdir = "depthanythingv2"
-    npz_path = os.path.join(scene_dir, depth_subdir, f"{frame_idx:06d}.npz")
+def load_depth(scene_dir: str, depth_dir: str, frame_idx: int) -> np.ndarray | None:
+    """Load a depth .npz, returning float32 (H, W) or None."""
+    npz_path = os.path.join(scene_dir, depth_dir, f"{frame_idx:06d}.npz")
     if not os.path.exists(npz_path):
         return None
     with np.load(npz_path) as data:
@@ -133,7 +115,13 @@ def main():
     parser.add_argument("--out-dir", required=True,
                         help="Directory to write boxes.json into (created if missing)")
     parser.add_argument("--label", default="object", help="Object label")
-    parser.add_argument("--source", default="colmap", choices=["colmap", "cut3r", "wilddet3d", "vggt", "da3", "pi3", "mapanything", "worldmirror", "worldmirror2"])
+    parser.add_argument("--cameras-dir", default="colmap",
+                        help="Scene-relative dir holding cameras.json")
+    parser.add_argument("--depth-dir", default="depthanythingv2",
+                        help="Scene-relative dir holding per-frame NNNNNN.npz depth maps "
+                             "(used only when --use-depth is set)")
+    parser.add_argument("--pointmap-dir", default=None,
+                        help="Unused; accepted for dispatch compatibility with run_boxer.")
     parser.add_argument("--use-intrinsics", action="store_true",
                         help="Pass camera intrinsics to the model")
     parser.add_argument("--use-depth", action="store_true",
@@ -144,11 +132,12 @@ def main():
 
     scene_dir = args.scene_dir
     analysis_dir = args.analysis_dir
+    cameras_dir = args.cameras_dir
+    depth_dir = args.depth_dir
 
     # Load data
-    print(f"[wilddet3d] Loading cameras from {scene_dir}")
-    source = args.source
-    cameras = load_cameras(scene_dir, source)
+    print(f"[wilddet3d] Loading cameras from {scene_dir}/{cameras_dir}")
+    cameras = load_cameras(scene_dir, cameras_dir)
     print(f"[wilddet3d] Loading track from {analysis_dir}")
     track = load_track(analysis_dir)
 
@@ -259,7 +248,7 @@ def main():
         # Prepare depth input if requested
         depth_gt = None
         if args.use_depth:
-            depth_np = load_depth(scene_dir, frame_idx, source)
+            depth_np = load_depth(scene_dir, depth_dir, frame_idx)
             if depth_np is not None:
                 # Resize depth to model input size (1008x1008)
                 depth_resized = cv2.resize(depth_np, (1008, 1008),

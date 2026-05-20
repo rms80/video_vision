@@ -27,11 +27,11 @@ export interface ScenePlugin {
   /** Subdirectory under `_scene/` holding per-frame NNNNNN.npz depth maps. */
   depthDir: string;
   /**
-   * Value to pass as `--source` to downstream scripts (align_scene,
-   * run_boxer, run_wilddet3d). `null` means omit the flag — those scripts
-   * then fall back to their built-in default (COLMAP).
+   * Subdirectory under `_scene/` holding per-frame NNNNNN.npz pointmaps.
+   * Set iff features.pointmap is true. Passed to downstream scripts as
+   * `--pointmap-dir`; if unset, pointmap-aware scripts skip pointmap I/O.
    */
-  sourceFlag: string | null;
+  pointmapDir?: string;
   /** Log filename under `_scene/` where pipeline stdout+stderr is appended. */
   logFile: string;
   /**
@@ -78,6 +78,31 @@ export interface ScenePlugin {
    */
   subsampleScript?: string;
   /**
+   * If set, the runner script takes a "process exactly N frames" int and
+   * the UI shows a "Target frames" input. Used by plugins that select a
+   * fixed-cardinality frame set rather than a stride (VGGT, VGGT-Omega).
+   * The number is the script's own default, kept in sync.
+   */
+  targetFramesDefault?: number;
+  /**
+   * If set, the UI shows an "Upscale" dropdown listing these float
+   * multipliers. The runner gets `--upscale <factor>`. Recorded in
+   * cameras.json as `upscale` so the dropdown can sync to what was
+   * computed. Used by plugins whose output resolution scales with an
+   * arbitrary factor (e.g. InfiniDepth's neural implicit field).
+   */
+  upscaleOptions?: number[];
+  upscaleDefault?: number;
+  /**
+   * If true, this plugin consumes another scene plugin's `cameras.json` as
+   * input. The UI shows a "Camera source" dropdown of ready scene plugins
+   * (excluding this one); the dev server resolves the selection to the
+   * absolute path of that plugin's cameras.json and appends it to the
+   * runner's args as `--source-cameras-json <abs path>`. The selection is
+   * sent in the prepare body as `options.cameraSource: "<pluginId>"`.
+   */
+  requiresCameraSource?: boolean;
+  /**
    * Checks the backend runs to decide whether this plugin is installed
    * (i.e. its setup script has been run). Plugin is "available" iff every
    * listed file/dir path exists, every command resolves on PATH, and
@@ -100,7 +125,6 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     label: "COLMAP + DepthAnythingV2",
     camerasDir: "colmap",
     depthDir: "depthanythingv2",
-    sourceFlag: null,
     logFile: "prepare.log",
     readyMarkers: ["colmap/cameras.json", "depthanythingv2/meta.json"],
     pipeline: [
@@ -121,7 +145,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     label: "CUT3R",
     camerasDir: "cut3r",
     depthDir: "cut3r/depth",
-    sourceFlag: "cut3r",
+    pointmapDir: "cut3r/pointmap",
     logFile: "cut3r.log",
     readyMarkers: ["cut3r/cameras.json"],
     pipeline: [
@@ -140,7 +164,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     label: "VGGT",
     camerasDir: "vggt",
     depthDir: "vggt/depth",
-    sourceFlag: "vggt",
+    pointmapDir: "vggt/pointmap",
     logFile: "vggt.log",
     readyMarkers: ["vggt/cameras.json"],
     pipeline: [
@@ -149,9 +173,30 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     cleanDir: "vggt",
     requiresFrames: true,
     features: { pointmap: true },
+    targetFramesDefault: 15,
     availability: {
       paths: ["models/external/vggt"],
       hfRepos: ["facebook/VGGT-1B"],
+    },
+  },
+  {
+    id: "vggtomega",
+    label: "VGGT-Omega",
+    camerasDir: "vggtomega",
+    depthDir: "vggtomega/depth",
+    pointmapDir: "vggtomega/pointmap",
+    logFile: "vggtomega.log",
+    readyMarkers: ["vggtomega/cameras.json"],
+    pipeline: [
+      { stage: "running", script: "run_vggtomega.py", args: ["$SCENE"] },
+    ],
+    cleanDir: "vggtomega",
+    requiresFrames: true,
+    features: { pointmap: true },
+    targetFramesDefault: 50,
+    availability: {
+      paths: ["models/external/vggt-omega"],
+      hfRepos: ["facebook/VGGT-Omega"],
     },
   },
   {
@@ -159,7 +204,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     label: "Depth-Anything-3 Metric (Large)",
     camerasDir: "da3",
     depthDir: "da3/depth",
-    sourceFlag: "da3",
+    pointmapDir: "da3/pointmap",
     logFile: "da3.log",
     readyMarkers: ["da3/cameras.json"],
     pipeline: [
@@ -178,7 +223,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     label: "Pi3",
     camerasDir: "pi3",
     depthDir: "pi3/depth",
-    sourceFlag: "pi3",
+    pointmapDir: "pi3/pointmap",
     logFile: "pi3.log",
     readyMarkers: ["pi3/cameras.json"],
     pipeline: [
@@ -197,7 +242,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     label: "MapAnything",
     camerasDir: "mapanything",
     depthDir: "mapanything/depth",
-    sourceFlag: "mapanything",
+    pointmapDir: "mapanything/pointmap",
     logFile: "mapanything.log",
     readyMarkers: ["mapanything/cameras.json"],
     pipeline: [
@@ -216,7 +261,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     label: "HunyuanWorld-Mirror 2.0",
     camerasDir: "worldmirror2",
     depthDir: "worldmirror2/depth",
-    sourceFlag: "worldmirror2",
+    pointmapDir: "worldmirror2/pointmap",
     logFile: "worldmirror2.log",
     readyMarkers: ["worldmirror2/cameras.json"],
     pipeline: [
@@ -236,7 +281,7 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     label: "HunyuanWorld-Mirror",
     camerasDir: "worldmirror",
     depthDir: "worldmirror/depth",
-    sourceFlag: "worldmirror",
+    pointmapDir: "worldmirror/pointmap",
     logFile: "worldmirror.log",
     readyMarkers: ["worldmirror/cameras.json"],
     pipeline: [
@@ -252,11 +297,34 @@ export const SCENE_PLUGINS: ScenePlugin[] = [
     },
   },
   {
+    id: "infinidepth",
+    label: "InfiniDepth",
+    camerasDir: "infinidepth",
+    depthDir: "infinidepth/depth",
+    pointmapDir: "infinidepth/pointmap",
+    logFile: "infinidepth.log",
+    readyMarkers: ["infinidepth/cameras.json"],
+    pipeline: [
+      { stage: "running", script: "run_infinidepth.py", args: ["$SCENE"] },
+    ],
+    cleanDir: "infinidepth",
+    requiresFrames: true,
+    features: { pointmap: true },
+    requiresCameraSource: true,
+    upscaleOptions: [1, 1.5, 2],
+    upscaleDefault: 1,
+    availability: {
+      paths: [
+        "models/external/infinidepth",
+        "models/weights/infinidepth/depth/infinidepth.ckpt",
+      ],
+    },
+  },
+  {
     id: "wilddet3d",
     label: "WildDet3D (depth + K)",
     camerasDir: "wilddet3d",
     depthDir: "wilddet3d/depth",
-    sourceFlag: "wilddet3d",
     logFile: "wilddet3d_scene.log",
     readyMarkers: ["wilddet3d/cameras.json"],
     pipeline: [

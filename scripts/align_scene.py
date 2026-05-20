@@ -31,14 +31,18 @@ def main():
     parser = argparse.ArgumentParser(description="Align scene to floor plane")
     parser.add_argument("scene_dir", help="Path to _scene directory")
     parser.add_argument("points_json", help="JSON array of {x, y, frame} or @filename")
-    parser.add_argument("--source", default="colmap",
-                        help="Scene source subdirectory (colmap, cut3r, vggt, ...)")
+    parser.add_argument("--cameras-dir", default="colmap",
+                        help="Scene-relative dir holding cameras.json (also where "
+                             "scene-level outputs like scene_pointmap chunks live)")
+    parser.add_argument("--depth-dir", default="depthanythingv2",
+                        help="Scene-relative dir holding per-frame NNNNNN.npz depth maps")
     parser.add_argument("--worldup-id", default="",
                         help="Worldup point set ID to stamp into cameras.json")
     args = parser.parse_args()
 
     scene_dir = args.scene_dir
-    source = args.source
+    cameras_dir = args.cameras_dir
+    depth_dir = args.depth_dir
 
     # Parse points
     pj = args.points_json
@@ -53,7 +57,7 @@ def main():
         sys.exit(1)
 
     # Load cameras.json
-    cameras_path = os.path.join(scene_dir, source, "cameras.json")
+    cameras_path = os.path.join(scene_dir, cameras_dir, "cameras.json")
     with open(cameras_path) as f:
         cameras = json.load(f)
 
@@ -97,14 +101,7 @@ def main():
         t_cw = np.array(frame["t"], dtype=np.float64)
 
         # Load depth map
-        depth_path = os.path.join(
-            scene_dir,
-            {"cut3r": "cut3r/depth", "vggt": "vggt/depth", "da3": "da3/depth",
-             "pi3": "pi3/depth", "mapanything": "mapanything/depth",
-             "worldmirror": "worldmirror/depth",
-             "worldmirror2": "worldmirror2/depth"}.get(source, "depthanythingv2"),
-            f"{best_idx:06d}.npz"
-        )
+        depth_path = os.path.join(scene_dir, depth_dir, f"{best_idx:06d}.npz")
         if not os.path.exists(depth_path):
             print(f"[align] WARNING: no depth for frame {best_idx}, skipping")
             continue
@@ -257,7 +254,7 @@ def main():
     # Points are stored in Three.js convention (x, -y, -z). For each chunk
     # we un-flip to OpenCV world, apply R_total, then re-flip — keeping the
     # working set bounded so we don't materialize a 100M-point array.
-    src_dir = Path(scene_dir) / source
+    src_dir = Path(scene_dir) / cameras_dir
     if chunked_pointcloud_exists(src_dir, "scene_pointmap"):
         total = 0
         for ci, pts_in, rgb, conf in iter_chunked_pointcloud(src_dir, "scene_pointmap"):

@@ -222,9 +222,17 @@ function resolveSourcePlugin(source: unknown): ScenePlugin {
   return getScenePluginOrDefault(typeof source === "string" ? source : null);
 }
 
-/** Build the ["--source", X] args, or [] if the plugin has no source flag. */
-function sourceFlagArgs(plugin: ScenePlugin): string[] {
-  return plugin.sourceFlag ? ["--source", plugin.sourceFlag] : [];
+/**
+ * Build the per-scene-plugin path args every downstream consumer script
+ * needs: where to find cameras.json, depth maps, and (optionally) per-frame
+ * pointmaps. Paths are scene-relative; consumers join them against the
+ * scene dir. Centralizing here means adding a new plugin doesn't require
+ * touching any script's hardcoded {id -> subdir} table.
+ */
+function scenePathArgs(plugin: ScenePlugin): string[] {
+  const args = ["--cameras-dir", plugin.camerasDir, "--depth-dir", plugin.depthDir];
+  if (plugin.pointmapDir) args.push("--pointmap-dir", plugin.pointmapDir);
+  return args;
 }
 
 // Lines prefixed with this marker are surfaced live to the UI status bar
@@ -670,11 +678,40 @@ function segViewerPlugin(): Plugin {
                     const n = Math.max(1, Math.round(Number(options.subsample)));
                     args.push(plugin.subsampleFlag ?? "--subsample", String(n));
                   }
-                  if (plugin.id === "vggt" && step.script === "run_vggt.py"
+                  if (plugin.targetFramesDefault !== undefined
                       && options && Number.isFinite(Number(options.numFrames))) {
                     const T = Math.max(1, Math.round(Number(options.numFrames)));
                     args.push("--num-frames", String(T));
-                    console.log(`[scene:vggt] targeting ${T} frames`);
+                    console.log(`[scene:${plugin.id}] targeting ${T} frames`);
+                  }
+                  if (plugin.requiresCameraSource) {
+                    const sourceId = typeof options?.cameraSource === "string"
+                      ? options.cameraSource : "";
+                    const sourcePlugin = SCENE_PLUGINS.find((p) => p.id === sourceId);
+                    if (!sourcePlugin || sourcePlugin.id === plugin.id) {
+                      throw new Error(`Missing or invalid cameraSource for ${plugin.id}`);
+                    }
+                    const srcCamPath = path.join(sd, sourcePlugin.camerasDir, "cameras.json");
+                    if (!fs.existsSync(srcCamPath)) {
+                      throw new Error(
+                        `Camera source ${sourcePlugin.id} has no cameras.json at ${srcCamPath}`,
+                      );
+                    }
+                    const srcDepthDir = path.join(sd, sourcePlugin.depthDir);
+                    if (!fs.existsSync(srcDepthDir)) {
+                      throw new Error(
+                        `Camera source ${sourcePlugin.id} has no depth dir at ${srcDepthDir}`,
+                      );
+                    }
+                    args.push("--source-cameras-json", srcCamPath);
+                    args.push("--source-depth-dir", srcDepthDir);
+                    console.log(`[scene:${plugin.id}] camera source = ${sourcePlugin.id}`);
+                  }
+                  if (plugin.upscaleDefault !== undefined
+                      && options && Number.isFinite(Number(options.upscale))) {
+                    const u = Number(options.upscale);
+                    args.push("--upscale", String(u));
+                    console.log(`[scene:${plugin.id}] upscale = ${u}`);
                   }
                   console.log(`[scene:${plugin.id}] ${video}: ${step.stage} (${step.script})`);
                   // Already-cancelled before spawning the next step? Bail.
@@ -763,10 +800,11 @@ function segViewerPlugin(): Plugin {
             // Aligning rewrites this source's cameras.json + depth scale, which
             // invalidates any prior per-object cloud built from it.
             deleteObjectPointmapsForSource(video, plugin.id);
-            // align_scene.py always wants --source=<camerasDir> so it knows where to read/write
+            // Pass the active plugin's scene-relative dirs so align_scene
+            // reads cameras.json + depth maps from the right place.
             console.log(`[align] running on ${video} with ${points.length} floor points`);
             try {
-              await runPython(scriptPath, [sd, pointsJson, "--source", plugin.camerasDir, ...extraArgs], logPath);
+              await runPython(scriptPath, [sd, pointsJson, ...scenePathArgs(plugin), ...extraArgs], logPath);
               res.setHeader("Content-Type", "application/json");
               res.end(JSON.stringify({ ok: true }));
             } catch (err: any) {
@@ -851,6 +889,54 @@ function segViewerPlugin(): Plugin {
           artifacts: sceneArtifactState(video),
           job: sceneJobs.get(video) ?? null,
         }));
+      });
+
+      // GET /api/scene/camera-sources?video=<filename>&self=<pluginId>
+      // List scene plugins that already have a cameras.json for this video.
+      // Used by plugins with `requiresCameraSource: true` (e.g. InfiniDepth)
+      // to populate their "Camera source" dropdown. The `self` plugin is
+      // excluded from the list. Additionally returns `currentSource`: the
+      // upstream plugin id recorded in self's own cameras.json (if any), so
+      // the dropdown can reflect what was actually computed, not just the
+      // last in-memory selection.
+      server.middlewares.use("/api/scene/camera-sources", (req, res, next) => {
+        if (req.method !== "GET") return next();
+        const url = new URL(req.url!, `http://${req.headers.host}`);
+        const video = url.searchParams.get("video");
+        const self = url.searchParams.get("self");
+        if (!video) {
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: "Missing video" }));
+          return;
+        }
+        const sd = sceneDir(video);
+        const sources = SCENE_PLUGINS
+          .filter((p) => p.id !== self && !p.requiresCameraSource)
+          .map((p) => ({
+            id: p.id,
+            label: p.label,
+            ready: fs.existsSync(path.join(sd, p.camerasDir, "cameras.json")),
+          }))
+          .filter((s) => s.ready);
+        let currentSource: string | null = null;
+        const selfPlugin = SCENE_PLUGINS.find((p) => p.id === self);
+        if (selfPlugin) {
+          const selfCamPath = path.join(sd, selfPlugin.camerasDir, "cameras.json");
+          if (fs.existsSync(selfCamPath)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(selfCamPath, "utf-8"));
+              const srcPath: unknown = data?.source_cameras;
+              if (typeof srcPath === "string" && srcPath) {
+                const dirName = path.basename(path.dirname(srcPath));
+                const match = SCENE_PLUGINS.find((p) => p.camerasDir === dirName);
+                if (match) currentSource = match.id;
+              }
+            } catch { /* ignore unparseable cameras.json */ }
+          }
+        }
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ sources, currentSource }));
       });
 
       // GET /api/scene/cameras?video=<filename> — return cameras.json
@@ -1354,7 +1440,7 @@ function segViewerPlugin(): Plugin {
               sd, runDir,
               "--out-dir", outDir,
               ...(label ? ["--label", label] : []),
-              ...sourceFlagArgs(plugin),
+              ...scenePathArgs(plugin),
               ...optionFlags,
             ];
             const flagSummary = optionFlags.length ? ` ${optionFlags.join(" ")}` : "";
@@ -1491,7 +1577,7 @@ function segViewerPlugin(): Plugin {
             const scriptPath = path.join(SCRIPTS_DIR, "build_object_pointmap.py");
             const pyArgs = [
               sd, runDir,
-              "--source", plugin.id,
+              "--cameras-dir", plugin.camerasDir,
               "--depth-dir", plugin.depthDir,
               "--out", outPath,
             ];

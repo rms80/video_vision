@@ -5,9 +5,10 @@ Usage:
         [--label LABEL] [--thresh3d 0.5]
 
 Reads:
-    <scene_dir>/<source>/cameras.json  — camera intrinsics + per-frame poses
-    <scene_dir>/<depth_dir>/*.npz      — per-frame depth maps
-    <analysis_dir>/track.json         — per-frame 2D bboxes from SAM2 tracking
+    <scene_dir>/<cameras_dir>/cameras.json   — camera intrinsics + per-frame poses
+    <scene_dir>/<depth_dir>/*.npz            — per-frame depth maps
+    <scene_dir>/<pointmap_dir>/*.npz         — per-frame pointmaps (optional)
+    <analysis_dir>/track.json                — per-frame 2D bboxes from SAM2 tracking
 
 Outputs:
     <out_dir>/boxes.json              — per-frame 3D oriented bounding boxes
@@ -46,8 +47,8 @@ from utils.tw.pose import PoseTW
 from utils.tw.obb import ObbTW
 
 
-def load_cameras(scene_dir: str, source: str = "colmap") -> dict:
-    cam_path = os.path.join(scene_dir, source, "cameras.json")
+def load_cameras(scene_dir: str, cameras_dir: str) -> dict:
+    cam_path = os.path.join(scene_dir, cameras_dir, "cameras.json")
     with open(cam_path) as f:
         return json.load(f)
 
@@ -58,12 +59,9 @@ def load_track(analysis_dir: str) -> dict:
         return json.load(f)
 
 
-def load_depth(scene_dir: str, frame_idx: int, source: str = "colmap") -> np.ndarray | None:
-    """Load an aligned depth .npz, returning float32 (H, W) or None."""
-    depth_subdir = {"cut3r": "cut3r/depth", "vggt": "vggt/depth", "da3": "da3/depth", "pi3": "pi3/depth", "mapanything": "mapanything/depth", "worldmirror": "worldmirror/depth", "worldmirror2": "worldmirror2/depth"}.get(source, "depthanythingv2")
-    npz_path = os.path.join(
-        scene_dir, depth_subdir, f"{frame_idx:06d}.npz"
-    )
+def load_depth(scene_dir: str, depth_dir: str, frame_idx: int) -> np.ndarray | None:
+    """Load a depth .npz, returning float32 (H, W) or None."""
+    npz_path = os.path.join(scene_dir, depth_dir, f"{frame_idx:06d}.npz")
     if not os.path.exists(npz_path):
         return None
     with np.load(npz_path) as data:
@@ -71,12 +69,9 @@ def load_depth(scene_dir: str, frame_idx: int, source: str = "colmap") -> np.nda
     return depth
 
 
-def load_pointmap(scene_dir: str, frame_idx: int, source: str = "cut3r") -> tuple[np.ndarray, np.ndarray] | None:
+def load_pointmap(scene_dir: str, pointmap_dir: str, frame_idx: int) -> tuple[np.ndarray, np.ndarray] | None:
     """Load a camera-frame pointmap .npz, returning (pts3d (H,W,3), conf (H,W)) or None."""
-    subdir = source if source in ("vggt", "da3", "pi3", "mapanything", "worldmirror", "worldmirror2") else "cut3r"
-    npz_path = os.path.join(
-        scene_dir, subdir, "pointmap", f"{frame_idx:06d}.npz"
-    )
+    npz_path = os.path.join(scene_dir, pointmap_dir, f"{frame_idx:06d}.npz")
     if not os.path.exists(npz_path):
         return None
     with np.load(npz_path) as data:
@@ -212,19 +207,26 @@ def main():
                         help="3D confidence threshold")
     parser.add_argument("--fuse", action="store_true",
                         help="Run post-hoc 3D box fusion across frames")
-    parser.add_argument("--source", default="colmap",
-                        help="Scene source (colmap, cut3r, vggt, ...)")
+    parser.add_argument("--cameras-dir", default="colmap",
+                        help="Scene-relative dir holding cameras.json")
+    parser.add_argument("--depth-dir", default="depthanythingv2",
+                        help="Scene-relative dir holding per-frame NNNNNN.npz depth maps")
+    parser.add_argument("--pointmap-dir", default=None,
+                        help="Scene-relative dir holding per-frame NNNNNN.npz camera-space "
+                             "pointmaps. If unset, the solver only consumes depth.")
     parser.add_argument("--force-precision", choices=["float32", "bfloat16"],
                         default=None)
     args = parser.parse_args()
 
     scene_dir = args.scene_dir
     analysis_dir = args.analysis_dir
+    cameras_dir = args.cameras_dir
+    depth_dir = args.depth_dir
+    pointmap_dir = args.pointmap_dir
 
     # Load data
-    print(f"[boxer] Loading cameras from {scene_dir}")
-    source = args.source
-    cameras = load_cameras(scene_dir, source)
+    print(f"[boxer] Loading cameras from {scene_dir}/{cameras_dir}")
+    cameras = load_cameras(scene_dir, cameras_dir)
     print(f"[boxer] Loading track from {analysis_dir}")
     track = load_track(analysis_dir)
 
@@ -370,7 +372,7 @@ def main():
         T_wr = PoseTW(torch.tensor([*R_flat, *t_vec], dtype=torch.float32))
 
         # Load semi-dense points: prefer pointmap (direct 3D) over depth (unproject through K)
-        pm = load_pointmap(scene_dir, frame_idx, source) if source in ("cut3r", "vggt", "da3", "pi3", "mapanything", "worldmirror", "worldmirror2") else None
+        pm = load_pointmap(scene_dir, pointmap_dir, frame_idx) if pointmap_dir else None
         if pm is not None:
             pts3d, conf = pm
             sdp_w = sdp_from_pointmap(
@@ -379,7 +381,7 @@ def main():
                 num_samples=10000,
             )
         else:
-            depth_np = load_depth(scene_dir, frame_idx, source)
+            depth_np = load_depth(scene_dir, depth_dir, frame_idx)
             if depth_np is not None:
                 # Resize depth to model resolution for correct unprojection
                 depth_model = cv2.resize(depth_np, (model_hw, model_hw),
