@@ -29,10 +29,12 @@ needing a refresh.
    `analysis/<video>/_scene/frames/`. 
 
 2. **Scene analysis**. Pick a
-   reconstruction method (COLMAP, CUT3R, VGGT, DA3, Pi3, MapAnything,
-   WorldMirror 1.0 / 2.0) and run. Produces camera poses + intrinsics +
-   per-frame depth, and (for most plugins) per-frame and/or
-   global pointmaps.
+   reconstruction method (COLMAP, CUT3R, VGGT, VGGT-Omega, DA3, Pi3,
+   MapAnything, WorldMirror 1.0 / 2.0) and run. Produces camera poses +
+   intrinsics + per-frame depth, and (for most plugins) per-frame and/or
+   global pointmaps. **InfiniDepth** is also available as a depth
+   *refiner* — it consumes an upstream plugin's poses + depth and
+   sharpens the per-frame depth via a neural implicit field.
 
 3. **World-up annotation** (optional). Click 3+
    points on horizontal surfaces (floor, table) across one or more
@@ -100,10 +102,16 @@ track, box, object cloud).
   CUDA RoPE extension (`curope`) to build. Skipping this is fine —
   CUT3R falls back to a slower pure-Python RoPE.
 - **Homebrew** on macOS (only for COLMAP).
-- **Hugging Face account with access to [`facebook/sam3`](https://huggingface.co/facebook/sam3)**
-  if you want object detection/tracking. SAM3 is a gated repo: open the
-  link, request access (one-time form, manually approved by Meta), then
-  authenticate the project venv after running `setup/00_venv.py`:
+- **Hugging Face account with access to gated repos** if you want any
+  of the gated plugins:
+  - [`facebook/sam3`](https://huggingface.co/facebook/sam3) — required
+    for object detection/tracking.
+  - [`facebook/VGGT-Omega`](https://huggingface.co/facebook/VGGT-Omega) —
+    required for the VGGT-Omega scene plugin.
+
+  Each is a gated repo: open the link, request access (one-time form,
+  manually approved by Meta), then authenticate the project venv after
+  running `setup/00_venv.py`:
 
   ```
   models/.venv/bin/hf auth login     # macOS / Linux
@@ -112,24 +120,47 @@ track, box, object cloud).
 
   Paste a token from <https://huggingface.co/settings/tokens> (read
   scope is sufficient). The old `huggingface-cli login` command is
-  deprecated — use `hf auth login`. `setup/plugin_sam.py` will refuse to run
-  until the token is in place and prints the same instructions if it
-  hits a 401 / gated-repo error.
+  deprecated — use `hf auth login`. The gated setup scripts refuse to
+  run until the token is in place and print the same instructions if
+  they hit a 401 / gated-repo error.
 
 Everything else — torch, all model repos, all checkpoints, COLMAP —
 lands under `models/`, which is gitignored.
 
-### One-shot install
+### Install (GUI)
+
+The easiest way is the bundled Tk installer:
+
+```
+npm install
+python setup/INSTALL.py
+```
+
+A small window opens with one checkbox per setup step. The base venv
+plus `COLMAP / DepthAnythingV2 / Pi3` are pre-checked as a sensible
+default install; toggle the rest on/off and click **Install selected**.
+Each script's output streams into the log pane. Gated plugins
+(`plugin_sam`, `plugin_vggtomega`) show a **Request Approval** link
+next to their row — clicking opens the HuggingFace repo page where you
+can request access. The **--force** checkbox forwards `--force` to
+every selected script (wipes and reinstalls).
+
+Tkinter ships with Python on Windows / macOS. On Debian/Ubuntu install
+`python3-tk` first; on Fedora/RHEL install `python3-tkinter`.
+
+### Install (headless)
+
+If you can't run a GUI, use the unconditional installer:
 
 ```
 npm install
 python setup/EVERYTHING.py
 ```
 
-`setup/EVERYTHING.py` runs
-`00_venv.py` first and then every `plugin_*.py` in order. Each script
-is **idempotent**: it skips already-present artifacts and only re-does
-work when invoked with `--force`. Re-running `EVERYTHING.py` is safe.
+`setup/EVERYTHING.py` runs `00_venv.py` first and then every
+`plugin_*.py` in order. Each script is **idempotent**: it skips
+already-present artifacts and only re-does work when invoked with
+`--force`. Re-running `EVERYTHING.py` is safe.
 
 ### Per-component install
 
@@ -141,14 +172,16 @@ python setup/plugin_colmap.py              # if you want the COLMAP plugin
 python setup/plugin_depthanythingv2.py     # paired with COLMAP
 python setup/plugin_cut3r.py
 python setup/plugin_vggt.py
+python setup/plugin_vggtomega.py           # gated HF repo
 python setup/plugin_da3.py
 python setup/plugin_pi3.py
 python setup/plugin_mapanything.py
 python setup/plugin_worldmirror.py
 python setup/plugin_worldmirror2.py
 python setup/plugin_wilddet3d.py           # provides scene AND box solver
+python setup/plugin_infinidepth.py         # depth refiner (post-process)
 python setup/plugin_boxer.py
-python setup/plugin_sam.py                 # required for detect/track
+python setup/plugin_sam.py                 # required for detect/track (gated)
 ```
 
 Every script supports `--force` to wipe its artifact and reinstall.
@@ -179,13 +212,16 @@ models/
     depth-anything-3/
     hunyuanworld-mirror/
     hy-world-2.0/
+    infinidepth/
     vggt/
+    vggt-omega/
     wilddet3d/                      cloned --recursive (sam3, lingbot_depth submodules)
   tools/
     colmap/                         Windows only; macOS uses Homebrew's binary
   weights/
     sam2.1_l.pt
     sam3.pt
+    infinidepth/depth/infinidepth.ckpt
 ```
 
 HuggingFace-distributed weights live in the standard HF cache
@@ -242,6 +278,19 @@ below comes straight from `setup/<name>.py`.
   alignment. The plugin **runs phase 1 only** (`--anchors-only`). Repo
   `requirements.txt` is installed filtered (skip torch/torchvision/numpy/
   pillow).
+
+#### VGGT-Omega — `id: vggtomega`
+- **Repo**: [`facebookresearch/vggt-omega`](https://github.com/facebookresearch/vggt-omega)
+  pinned to `39a0cb8af88554f15ddcb5354cd52bde588fa014`.
+- **HF model**: [`facebook/VGGT-Omega`](https://huggingface.co/facebook/VGGT-Omega)
+  — **gated** (request access, then `hf auth login`). The setup
+  downloads only the non-text 512-resolution checkpoint
+  (`vggt_omega_1b_512.pt`, ~4.58 GB); the 256-text variant is skipped
+  since we only consume camera + depth here.
+- **Notes**: Successor to VGGT-1B (CVPR 2026 Oral). Unlike VGGT-1B
+  it ships plain `.pt` state dicts (no `from_pretrained`). Repo
+  `requirements.txt` is installed filtered (skip torch/torchvision/
+  numpy/pillow).
 
 #### Depth-Anything-3 Metric (Large) — `id: da3`
 - **Repo**: [`ByteDance-Seed/Depth-Anything-3`](https://github.com/ByteDance-Seed/Depth-Anything-3)
@@ -334,6 +383,30 @@ below comes straight from `setup/<name>.py`.
   cross-frame pose solve** (every camera pose is identity). Useful as
   a depth/K signal, not as a real reconstruction.
 
+#### InfiniDepth (depth refiner) — `id: infinidepth`
+- **Repo**: [`zju3dv/InfiniDepth`](https://github.com/zju3dv/InfiniDepth)
+  pinned to `36c6e0c31887fafc210184ee43ca475230704095`.
+- **HF model**: `ritianyu/InfiniDepth` →
+  `models/weights/infinidepth/depth/infinidepth.ckpt`.
+- **Notes**: Not a standalone reconstruction. The runner consumes an
+  upstream plugin's `cameras.json` + per-frame depth and feeds them
+  through InfiniDepth's neural implicit field to produce a sharper /
+  higher-res depth map. Pick the upstream source in the UI when
+  running the plugin.
+- **Custom modifications applied by `setup/plugin_infinidepth.py`**:
+  - Filters upstream `requirements.txt` to skip
+    `torch/torchvision/torchaudio/numpy/pillow` (CUDA build in the
+    base venv), `xformers` (pins torch 2.9 and would clobber it),
+    `gsplat` (only used by the Gaussian-Splatting inference path,
+    which we don't run), `open3d` (no 3.13 wheel; viz-only), and
+    `spaces` (HF Space SDK shim).
+  - Explicitly pins `moviepy==1.0.3` because InfiniDepth imports
+    `moviepy.editor`, which 2.x dropped.
+  - Skips MoGe-2 entirely: the runner always supplies
+    `override_gt_depth` + intrinsics, so the lazy
+    `from moge.model.v2 import MoGeModel` import inside
+    `moge_utils._get_moge2_model` is never reached.
+
 ### Box solvers (per-object)
 
 #### Boxer — `id: boxer`
@@ -365,8 +438,8 @@ below comes straight from `setup/<name>.py`.
 #### SAM3 detect — `detect_object.py`
 - **Source**: [`facebook/sam3`](https://huggingface.co/facebook/sam3)
   on HF → `models/weights/sam3.pt`. **Gated repo**: request access on
-  the model page and `huggingface-cli login` into the project venv
-  before running `setup/plugin_sam.py`. See the [Setup](#setup) section.
+  the model page and `hf auth login` into the project venv before
+  running `setup/plugin_sam.py`. See the [Setup](#setup) section.
 - **Loaded via**: Ultralytics (`ultralytics>=8.4.37`).
 - **Inputs**: frame image, click x/y, label.
 - **Output**: `detect.json` (bbox + base64 RGBA mask) + `frame0_mask.png`.
