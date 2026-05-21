@@ -7,7 +7,7 @@ A browser-based workbench for experimenting with ML/Vision models for video proc
 * 3D bounding box 
 * Scene & Object point clouds
 
-Runs as a local backend server & frontend web app. **DO NOT** deploy on the internet - code has not been hardened. The UI is a Solid + Three.js
+Runs as a local backend server & frontend web app. The UI is a Solid + Three.js
 app served by Vite; all heavy lifting is done by Python scripts that the
 Vite dev server shells out to. A plugin architecture makes it easy to add additional models.
 
@@ -15,7 +15,11 @@ The repo bundles a Python `setup/` toolchain that installs every model
 into a single, gitignored `models/` directory: one venv, one set of
 pinned commits, one canonical location for weights.
 
----
+This repo has been almost entirely created by Claude Code, under step-by-step human guidance. **DO NOT** deploy on the internet - code has not been hardened.
+
+Questions / Comments? find me at rms@rms80.com, or [@rms80](http://twitter.com/rms80).
+
+
 
 ## Models Supported
 
@@ -41,7 +45,7 @@ pinned commits, custom patches, and per-plugin quirks.
   [ByteDance-Seed/Depth-Anything-3](https://github.com/ByteDance-Seed/Depth-Anything-3),
   pairs the LARGE-1.1 (pose + relative depth) and DA3METRIC-LARGE
   (metric depth) heads for metric-scale reconstructions.
-- **Pi3** — [yyfz/Pi3](https://github.com/yyfz/Pi3), single feed-forward
+- **Pi3X** — [yyfz/Pi3](https://github.com/yyfz/Pi3), single feed-forward
   pass producing per-frame pointmaps + a global scene pointmap; fits in
   12 GB VRAM.
 - **MapAnything** —
@@ -402,7 +406,7 @@ below comes straight from `setup/<name>.py`.
     PEP 440 reads as excluding 3.13.x patch releases. We install with
     `--ignore-requires-python --no-deps`.
 
-#### Pi3 — `id: pi3`
+#### Pi3 (Pi3X Variant) — `id: pi3`
 - **Source**: `pip install git+https://github.com/yyfz/Pi3.git@b412c3bd236dfd7686f1e4b48004d5087f2fa093`.
 - **HF model**: `yyfz233/Pi3X`.
 - **Notes**: Single feed-forward pass. The runner disables Pi3's
