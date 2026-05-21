@@ -15,6 +15,8 @@ The repo bundles a Python `setup/` toolchain that installs every model
 into a single, gitignored `models/` directory: one venv, one set of
 pinned commits, one canonical location for weights.
 
+All computed results are saved, and can be browsed from the frontend. 
+
 This repo has been almost entirely created by Claude Code, under step-by-step human guidance. **DO NOT** deploy on the internet - code has not been hardened.
 
 Questions / Comments? find me at rms@rms80.com, or [@rms80](http://twitter.com/rms80).
