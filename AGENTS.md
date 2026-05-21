@@ -33,7 +33,8 @@ All setup files live in `setup/` and follow the same shape:
 - `00_venv.py` — **always runs first**. Creates the venv (uses `uv
   venv --seed` on Linux when available, stdlib `venv` otherwise),
   installs torch + torchvision (CUDA wheels on Win/Linux, MPS on Mac),
-  installs base deps.
+  installs base deps (including `huggingface_hub`, so `hf` is available
+  in the venv).
 - `_lib.py` — shared helpers: `venv_python()`, `pip_install()`,
   `download()`, `hf_snapshot()`, `apply_patch()`, `find_nvcc()`,
   `find_vcvars()`, `install_requirements_filtered()` (skips
@@ -43,24 +44,39 @@ All setup files live in `setup/` and follow the same shape:
   via `apply_patch()`.
 - One script per model/tool:
   - **Scene plugins**: `plugin_colmap.py`, `plugin_depthanythingv2.py`,
-    `plugin_cut3r.py`, `plugin_vggt.py`, `plugin_da3.py`,
-    `plugin_pi3.py`, `plugin_mapanything.py`, `plugin_worldmirror.py`,
-    `plugin_worldmirror2.py`, `plugin_wilddet3d.py`.
+    `plugin_cut3r.py`, `plugin_vggt.py`, `plugin_vggtomega.py` *(gated
+    HF)*, `plugin_da3.py`, `plugin_pi3.py`, `plugin_mapanything.py`,
+    `plugin_worldmirror.py`, `plugin_worldmirror2.py`,
+    `plugin_wilddet3d.py`, `plugin_infinidepth.py` *(depth refiner —
+    consumes another plugin's poses + depth, not a standalone
+    reconstruction)*.
   - **Box solvers**: `plugin_boxer.py`, `plugin_wilddet3d.py` (same
     script provides both the scene + box-solver plugin).
-  - **Object seg**: `plugin_sam.py` (SAM2 + SAM3 weights).
-- `EVERYTHING.py` — runs `00_venv.py` then every `plugin_*.py` in
-  order. Forwards `--force` to each.
+  - **Object seg**: `plugin_sam.py` *(gated HF — `facebook/sam3`)*
+    pulls both SAM2 + SAM3 weights.
+- `EVERYTHING.py` — headless: runs `00_venv.py` then every
+  `plugin_*.py` in order. Forwards `--force` to each.
+- `INSTALL.py` — Tk-based GUI installer wrapping the same scripts:
+  checkbox per step, masked HF-token field (enabled only when a gated
+  plugin is checked) that runs `huggingface_hub.login()` in the venv
+  after `00_venv.py`, and a **--force** toggle.
 
 Each script is **idempotent** (skips already-installed artifacts) and
-supports `--force` to wipe and reinstall. `colmap.py` branches by OS:
-Windows downloads the prebuilt CUDA zip, macOS uses `brew`, Linux uses
-`apt-get` and auto-fixes known Ubuntu 26.04 packaging gaps (missing
-`libposelib`).
+supports `--force` to wipe and reinstall. `plugin_colmap.py` branches
+by OS: Windows downloads the prebuilt CUDA zip, macOS uses `brew`,
+Linux uses `apt-get` and auto-fixes known Ubuntu 26.04 packaging gaps
+(missing `libposelib`).
+
+Gated HF plugins (`plugin_sam`, `plugin_vggtomega`) need a token at
+`$HF_HOME/token` (per-user, shared across venvs) — paste it into the
+`INSTALL.py` GUI field, or run `hf auth login` from any environment.
 
 ## Dev server
 
-To start or restart the Vite dev server, run `bash run_server.sh`.
-It frees port 4444 (kills any existing listener) and runs `npm run dev`.
+To start or restart the Vite dev server:
+- **macOS / Linux**: `bash run_server.sh`
+- **Windows**: `run_server.bat`
+
+Both free port 4444 (kill any existing listener) and run `npm run dev`.
 Don't `npm run dev` directly — `strictPort: true` means a stale listener
 on 4444 will fail the start.
