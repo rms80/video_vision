@@ -7,7 +7,7 @@ A browser-based workbench for experimenting with ML/Vision models for video proc
 * 3D bounding box 
 * Scene & Object point clouds
 
-The UI is a Solid + Three
+Runs as a local backend server & frontend web app. **DO NOT** deploy on the internet - code has not been hardened. The UI is a Solid + Three.js
 app served by Vite; all heavy lifting is done by Python scripts that the
 Vite dev server shells out to. A plugin architecture makes it easy to add additional models.
 
@@ -16,6 +16,78 @@ into a single, gitignored `models/` directory: one venv, one set of
 pinned commits, one canonical location for weights.
 
 ---
+
+## Models Supported
+
+See the [Model / method reference](#model--method-reference) section below for
+pinned commits, custom patches, and per-plugin quirks.
+
+### Scene Analysis (Cameras + Depth)
+
+- **COLMAP + DepthAnythingV2** — classical SfM camera solve
+  ([COLMAP 4.0.3](https://github.com/colmap/colmap)) paired with
+  [DepthAnythingV2 Metric Indoor](https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf)
+  for per-frame depth, RANSAC-scaled to meters.
+- **CUT3R** — [CUT3R/CUT3R](https://github.com/CUT3R/CUT3R), feed-forward
+  poses + per-frame depth + pointmaps from a sliding context window.
+- **VGGT** — [facebookresearch/vggt](https://github.com/facebookresearch/vggt),
+  Meta's 1B transformer; anchors-only phase produces cameras + depth +
+  pointmaps in one shot.
+- **VGGT-Omega** *(gated)* —
+  [facebookresearch/vggt-omega](https://github.com/facebookresearch/vggt-omega),
+  CVPR 2026 successor to VGGT-1B. Requires HF access to
+  [`facebook/VGGT-Omega`](https://huggingface.co/facebook/VGGT-Omega).
+- **Depth-Anything-3 (Metric, Large)** —
+  [ByteDance-Seed/Depth-Anything-3](https://github.com/ByteDance-Seed/Depth-Anything-3),
+  pairs the LARGE-1.1 (pose + relative depth) and DA3METRIC-LARGE
+  (metric depth) heads for metric-scale reconstructions.
+- **Pi3** — [yyfz/Pi3](https://github.com/yyfz/Pi3), single feed-forward
+  pass producing per-frame pointmaps + a global scene pointmap; fits in
+  12 GB VRAM.
+- **MapAnything** —
+  [facebookresearch/map-anything](https://github.com/facebookresearch/map-anything),
+  memory-efficient inference with edge-aware scene-pointmap masking.
+- **HunyuanWorld-Mirror** —
+  [Tencent-Hunyuan/HunyuanWorld-Mirror](https://github.com/Tencent-Hunyuan/HunyuanWorld-Mirror),
+  Tencent's multi-head model (we use the pointmap + depth + camera
+  heads; gaussian-splat head stubbed out).
+- **HunyuanWorld-Mirror 2.0** —
+  [Tencent-Hunyuan/HY-World-2.0](https://github.com/Tencent-Hunyuan/HY-World-2.0),
+  v2 with a flash-attention-free SDPA shim.
+- **WildDet3D (depth + K)** —
+  [allenai/WildDet3D](https://github.com/allenai/WildDet3D), produces
+  depth + predicted intrinsics per frame (no cross-frame pose solve —
+  useful as a depth/K signal, not a real reconstruction).
+- **InfiniDepth** *(depth refiner)* —
+  [zju3dv/InfiniDepth](https://github.com/zju3dv/InfiniDepth). Not a
+  standalone reconstruction — consumes another plugin's cameras +
+  depth and sharpens the per-frame depth via a neural implicit field.
+
+### Object Segmentation
+
+- **SAM3 (detect)** *(gated)* —
+  [`facebook/sam3`](https://huggingface.co/facebook/sam3) via
+  Ultralytics. Click + text label → first-frame bbox & RGBA mask.
+- **SAM2 (track)** —
+  [`sam2.1_l.pt`](https://github.com/ultralytics/assets/releases/download/v8.3.0/sam2.1_l.pt)
+  via Ultralytics' `SAM2VideoPredictor`. Propagates the SAM3 detection
+  across all frames in the tracked range.
+
+### 3D Box Generation
+
+- **Boxer** *(default)* —
+  [facebookresearch/boxer](https://github.com/facebookresearch/boxer),
+  per-frame oriented bounding boxes from the masked depth/pointmap. The
+  *Fuse* toggle merges all frames into one shared static box (more
+  stable, slower).
+- **WildDet3D** —
+  [allenai/WildDet3D](https://github.com/allenai/WildDet3D), neural 3D
+  detector with optional *Use Cameras* (intrinsics prior) and *Use
+  Depth* toggles that pipe the active scene plugin's `K` / depth in as
+  priors.
+
+---
+
 
 ## Usage flow
 
@@ -28,13 +100,9 @@ needing a refresh.
    and pre-extracts every frame as a JPEG under
    `analysis/<video>/_scene/frames/`. 
 
-2. **Scene analysis**. Pick a
-   reconstruction method (COLMAP, CUT3R, VGGT, VGGT-Omega, DA3, Pi3,
-   MapAnything, WorldMirror 1.0 / 2.0) and run. Produces camera poses +
-   intrinsics + per-frame depth, and (for most plugins) per-frame and/or
+2. **Scene analysis**. Pick a method and run. Produces camera poses + intrinsics + per-frame depth, and (for most plugins) per-frame and/or
    global pointmaps. **InfiniDepth** is also available as a depth
-   *refiner* — it consumes an upstream plugin's poses + depth and
-   sharpens the per-frame depth via a neural implicit field.
+   *refiner*.
 
 3. **World-up annotation** (optional). Click 3+
    points on horizontal surfaces (floor, table) across one or more
@@ -90,81 +158,109 @@ track, box, object cloud).
 
 ## Setup
 
-### System prerequisites
+### 1. Model Access (Hugging Face)
 
-- **Python 3.11 or newer** on `PATH`. The setup scripts use only the
-  stdlib until the venv exists.
-- **Node.js 18+** for the Vite dev server (`npm install`).
+A few plugins pull weights from **gated** Hugging Face repos. Skip this
+step if you don't need them — the rest of the setup still works. To request acess, open the links below and fill out the form (approved by Meta, often within minutes)
+
+- [`facebook/sam3`](https://huggingface.co/facebook/sam3) — required
+  for object detection / tracking.
+- [`facebook/VGGT-Omega`](https://huggingface.co/facebook/VGGT-Omega) —
+  required for the VGGT-Omega scene plugin.
+
+While you are waiting, generate a token at <https://huggingface.co/settings/tokens> (*paste it into a text file until you have finished setup, as you only get to see it once on the website!*). Then either provide it in the text field in the GUI installer (see below) or run `hf auth login` (do `pip install -U huggingface_hub` to get the hf commands).
+
+### 2. Windows + CUDA setup
+
+**Prerequisites**
+
+- **Python 3.11+** on `PATH`. Setup scripts use only the stdlib until
+  the venv exists.
+- **Node.js 18+** for the Vite dev server.
 - **Git** (every external model is a pinned `git clone`).
-- **NVIDIA GPU + CUDA 12.4 driver** on Windows for the included torch
-  wheels. macOS uses default MPS wheels.
-- **Visual Studio 2019/2022 Build Tools** on Windows if you want CUT3R's
-  CUDA RoPE extension (`curope`) to build. Skipping this is fine —
+- **NVIDIA GPU + CUDA 12.4 driver** for the included torch wheels.
+- **Visual Studio 2019/2022 Build Tools** *(optional)* — only needed if
+  you want CUT3R's `curope` CUDA extension to build. Skipping is fine;
   CUT3R falls back to a slower pure-Python RoPE.
-- **Homebrew** on macOS (only for COLMAP).
-- **Hugging Face account with access to gated repos** if you want any
-  of the gated plugins:
-  - [`facebook/sam3`](https://huggingface.co/facebook/sam3) — required
-    for object detection/tracking.
-  - [`facebook/VGGT-Omega`](https://huggingface.co/facebook/VGGT-Omega) —
-    required for the VGGT-Omega scene plugin.
 
-  Each is a gated repo: open the link, request access (one-time form,
-  manually approved by Meta), then authenticate the project venv after
-  running `setup/00_venv.py`:
-
-  ```
-  models/.venv/bin/hf auth login     # macOS / Linux
-  models\.venv\Scripts\hf auth login # Windows
-  ```
-
-  Paste a token from <https://huggingface.co/settings/tokens> (read
-  scope is sufficient). The old `huggingface-cli login` command is
-  deprecated — use `hf auth login`. The gated setup scripts refuse to
-  run until the token is in place and print the same instructions if
-  they hit a 401 / gated-repo error.
-
-Everything else — torch, all model repos, all checkpoints, COLMAP —
-lands under `models/`, which is gitignored.
-
-### Install (GUI)
-
-The easiest way is the bundled Tk installer:
+**Install**
 
 ```
 npm install
-python setup/INSTALL.py
+python setup/INSTALL.py        # GUI (recommended)
 ```
 
-A small window opens with one checkbox per setup step. The base venv
-plus `COLMAP / DepthAnythingV2 / Pi3` are pre-checked as a sensible
-default install; toggle the rest on/off and click **Install selected**.
-Each script's output streams into the log pane. Gated plugins
-(`plugin_sam`, `plugin_vggtomega`) show a **Request Approval** link
-next to their row — clicking opens the HuggingFace repo page where you
-can request access. The **--force** checkbox forwards `--force` to
-every selected script (wipes and reinstalls).
+**Run the app**
 
-Tkinter ships with Python on Windows / macOS. On Debian/Ubuntu install
-`python3-tk` first; on Fedora/RHEL install `python3-tkinter`.
+```
+run_server.bat
+```
 
-### Install (headless)
+### 3. MacOS setup
 
-If you can't run a GUI, use the unconditional installer:
+**Prerequisites**
+
+- **Python 3.11+** on `PATH`.
+- **Node.js 18+**.
+- **Git**.
+- **Homebrew** — only used to install COLMAP.
+- No CUDA: macOS uses the default MPS torch wheels.
+
+**Install**
 
 ```
 npm install
-python setup/EVERYTHING.py
+python setup/INSTALL.py        # GUI (recommended)
 ```
 
-`setup/EVERYTHING.py` runs `00_venv.py` first and then every
-`plugin_*.py` in order. Each script is **idempotent**: it skips
-already-present artifacts and only re-does work when invoked with
-`--force`. Re-running `EVERYTHING.py` is safe.
+**Run the app**
 
-### Per-component install
+```
+bash run_server.sh
+```
 
-If you only need a subset of the plugins, install them piecewise:
+### 4. Linux + CUDA setup
+
+**Prerequisites**
+
+- **Python 3.11+** on `PATH`.
+- **Node.js 18+**.
+- **Git**.
+- **NVIDIA GPU + CUDA 12.4 driver** for the included torch wheels.
+- For the GUI installer: `python3-tk` on Debian/Ubuntu, or
+  `python3-tkinter` on Fedora/RHEL. The headless installer doesn't need
+  Tk.
+- On Ubuntu 26.04, `plugin_colmap.py` auto-fixes a known `libposelib`
+  packaging gap.
+
+**Install**
+
+```
+npm install
+python setup/INSTALL.py        # python GUI installer
+```
+
+**Run the app**
+
+```
+bash run_server.sh
+```
+
+
+### Install options
+
+Installers run `00_venv.py` first and then the requested
+`plugin_*.py` scripts. Every script is **idempotent** — it skips
+already-present artifacts — and supports `--force` to wipe and
+reinstall. Re-running either installer is safe.
+
+**GUI (`setup/INSTALL.py`)** — a Tk window with one checkbox per setup step (venv, plugins). Optionally enter your HF auth token for gated models. Each script's output streams into the log pane.
+The **--force** checkbox forwards `--force` to every selected script.
+
+**Headless (`setup/EVERYTHING.py`)** — runs every plugin in order,
+unconditionally. Use this when you can't run a GUI. Be aware this will consume approx 100GB of disk space.
+
+**Per-component** — if you only need a subset, run scripts piecewise:
 
 ```
 python setup/00_venv.py                    # always first
@@ -184,21 +280,16 @@ python setup/plugin_boxer.py
 python setup/plugin_sam.py                 # required for detect/track (gated)
 ```
 
-Every script supports `--force` to wipe its artifact and reinstall.
+Everything except COLMAP (Windows zip / macOS Homebrew / Linux apt) and
+the `models/.venv/` itself lands under `models/`, which is gitignored.
 
-### Running the app
+### Dev server notes
 
-**Windows**: 
-```
-run_server.bat
-```
-
-**OSX / Linux**:  
-```
-bash run_server.sh
-```
-
-The Vite dev server listens on **port 4444**. The scripts above will kill and restart the server if it's already running. Change this in the scripts if you want a different port.
+The Vite dev server listens on **port 4444**. `run_server.bat` /
+`run_server.sh` kill any existing listener on that port before starting
+— don't invoke `npm run dev` directly, since `strictPort: true` makes a
+stale listener fatal. Change the port in the script if you need a
+different one.
 
 
 ### Directory layout after install

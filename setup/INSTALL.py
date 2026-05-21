@@ -49,11 +49,20 @@ except ImportError:
 SETUP_DIR = Path(__file__).resolve().parent
 VENV_SCRIPT = SETUP_DIR / "00_venv.py"
 
+sys.path.insert(0, str(SETUP_DIR))
+from _lib import venv_python  # noqa: E402  (stdlib-only, safe pre-venv)
+
 DEFAULT_CHECKED = {"00_venv", "plugin_colmap", "plugin_depthanythingv2", "plugin_pi3"}
 GATED: dict[str, str] = {
     "plugin_sam": "https://huggingface.co/facebook/sam3",
     "plugin_vggtomega": "https://huggingface.co/facebook/VGGT-Omega",
 }
+
+HF_LOGIN_SNIPPET = (
+    "import sys\n"
+    "from huggingface_hub import login\n"
+    "login(token=sys.stdin.read().strip(), add_to_git_credential=False)\n"
+)
 
 
 def discover_plugins() -> list[Path]:
@@ -82,6 +91,7 @@ class InstallerApp:
         self.scripts: list[Path] = [VENV_SCRIPT, *discover_plugins()]
         self.vars: dict[Path, tk.BooleanVar] = {}
         self.force = tk.BooleanVar(value=False)
+        self.hf_token = tk.StringVar()
         self.proc: subprocess.Popen[str] | None = None
         self.worker: threading.Thread | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -106,6 +116,8 @@ class InstallerApp:
         for script in self.scripts:
             var = tk.BooleanVar(value=script.stem in DEFAULT_CHECKED)
             self.vars[script] = var
+            if script.stem in GATED:
+                var.trace_add("write", lambda *_: self._refresh_hf_state())
             row = ttk.Frame(list_outer, padding=(6, 2))
             row.pack(fill="x", anchor="w")
             ttk.Checkbutton(row, variable=var, text=script.stem, width=26).pack(
@@ -147,6 +159,28 @@ class InstallerApp:
             variable=self.force,
         ).pack(side="right")
 
+        hf_row = ttk.Frame(outer)
+        hf_row.pack(fill="x", pady=(0, 8))
+        self.hf_label = ttk.Label(hf_row, text="Hugging Face token:")
+        self.hf_label.pack(side="left")
+        self.hf_entry = ttk.Entry(hf_row, textvariable=self.hf_token, show="*")
+        self.hf_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        self.hf_link = ttk.Label(
+            hf_row,
+            text="Get token",
+            foreground="#0366d6",
+            cursor="hand2",
+            font=("TkDefaultFont", 9, "underline"),
+        )
+        self.hf_link.pack(side="left")
+        self.hf_link.bind(
+            "<Button-1>",
+            lambda _e: webbrowser.open_new_tab(
+                "https://huggingface.co/settings/tokens"
+            ),
+        )
+        self._refresh_hf_state()
+
         ttk.Label(outer, text="Log:").pack(anchor="w")
         self.log = scrolledtext.ScrolledText(
             outer, height=20, wrap="word", font=("Consolas", 9)
@@ -173,6 +207,18 @@ class InstallerApp:
     def _select_none(self) -> None:
         for v in self.vars.values():
             v.set(False)
+
+    def _any_gated_selected(self) -> bool:
+        return any(
+            self.vars[s].get() for s in self.scripts if s.stem in GATED
+        )
+
+    def _refresh_hf_state(self) -> None:
+        enabled = self._any_gated_selected()
+        state = "normal" if enabled else "disabled"
+        self.hf_entry.configure(state=state)
+        self.hf_label.configure(foreground="" if enabled else "#999")
+        self.hf_link.configure(foreground="#0366d6" if enabled else "#999")
 
     def _selected(self) -> list[Path]:
         return [s for s, v in self.vars.items() if v.get()]
@@ -203,8 +249,11 @@ class InstallerApp:
             return
         self.install_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
+        token = self.hf_token.get().strip() if self._any_gated_selected() else ""
         self.worker = threading.Thread(
-            target=self._run_all, args=(scripts, self.force.get()), daemon=True
+            target=self._run_all,
+            args=(scripts, self.force.get(), token),
+            daemon=True,
         )
         self.worker.start()
 
@@ -225,8 +274,15 @@ class InstallerApp:
                 pass
         self.root.destroy()
 
-    def _run_all(self, scripts: list[Path], force: bool) -> None:
+    def _run_all(self, scripts: list[Path], force: bool, token: str) -> None:
         failures: list[tuple[Path, int]] = []
+        venv_in_scripts = VENV_SCRIPT in scripts
+
+        # If the venv already exists, do the HF login up front so that any
+        # gated plugin scripts can use it.
+        if token and not venv_in_scripts and venv_python().exists():
+            self._hf_login(token)
+
         for s in scripts:
             cmd = [sys.executable, str(s)]
             if force:
@@ -258,6 +314,10 @@ class InstallerApp:
                 self.log_queue.put(
                     f"[INSTALL] {s.name} exited {rc}; continuing\n"
                 )
+                continue
+            # 00_venv just succeeded — log in to HF before any plugins run.
+            if s == VENV_SCRIPT and token:
+                self._hf_login(token)
 
         self.log_queue.put(f"\n{'=' * 72}\n")
         if failures:
@@ -273,6 +333,42 @@ class InstallerApp:
         self.log_queue.put(f"{'=' * 72}\n")
 
         self.root.after(0, self._on_done)
+
+    def _hf_login(self, token: str) -> bool:
+        py = venv_python()
+        if not py.exists():
+            self.log_queue.put(
+                f"[INSTALL] cannot run hf login: venv missing at {py}\n"
+            )
+            return False
+        self.log_queue.put(
+            f"\n{'=' * 72}\n[INSTALL] authenticating venv with Hugging Face\n"
+            f"{'=' * 72}\n"
+        )
+        try:
+            result = subprocess.run(
+                [str(py), "-c", HF_LOGIN_SNIPPET],
+                input=token,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as e:
+            self.log_queue.put(f"[INSTALL] hf login failed to start: {e}\n")
+            return False
+        if result.stdout:
+            self.log_queue.put(result.stdout)
+        if result.stderr:
+            self.log_queue.put(result.stderr)
+        if result.returncode != 0:
+            self.log_queue.put(
+                f"[INSTALL] hf login exited {result.returncode}; gated "
+                f"plugins will fail\n"
+            )
+            return False
+        self.log_queue.put("[INSTALL] hf login OK\n")
+        return True
 
     def _on_done(self) -> None:
         self.install_btn.configure(state="normal")
