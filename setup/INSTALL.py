@@ -181,15 +181,8 @@ class InstallerApp:
         )
         self._refresh_hf_state()
 
-        ttk.Label(outer, text="Log:").pack(anchor="w")
-        self.log = scrolledtext.ScrolledText(
-            outer, height=20, wrap="word", font=("Consolas", 9)
-        )
-        self.log.pack(fill="both", expand=True)
-        self.log.configure(state="disabled")
-
         actions = ttk.Frame(outer)
-        actions.pack(fill="x", pady=(8, 0))
+        actions.pack(fill="x", pady=(0, 8))
         self.install_btn = ttk.Button(
             actions, text="Install selected", command=self._on_install
         )
@@ -199,6 +192,13 @@ class InstallerApp:
         )
         self.cancel_btn.pack(side="left", padx=(6, 0))
         ttk.Button(actions, text="Close", command=self._on_close).pack(side="right")
+
+        ttk.Label(outer, text="Log:").pack(anchor="w")
+        self.log = scrolledtext.ScrolledText(
+            outer, height=20, wrap="word", font=("Consolas", 9)
+        )
+        self.log.pack(fill="both", expand=True)
+        self.log.configure(state="disabled")
 
     def _select_all(self) -> None:
         for v in self.vars.values():
