@@ -2,6 +2,7 @@ import { createSignal, createEffect, createMemo, For, Show, onMount, onCleanup, 
 import { parseNpz } from "./npz";
 import type { CamerasJson } from "./depthMesh";
 import ThreeDepthViewer, { type BoxerResult } from "./ThreeDepthViewer";
+import DinoV3Viewer, { type DinoV3Meta } from "./DinoV3Viewer";
 import {
   SCENE_PLUGINS,
   SCENE_PLUGINS_BY_ID,
@@ -154,6 +155,47 @@ export default function App() {
   const [availableBoxSolverIds, setAvailableBoxSolverIds] = createSignal<Set<string> | null>(null);
   const [sam2Available, setSam2Available] = createSignal<boolean>(true);
   const [sam3Available, setSam3Available] = createSignal<boolean>(true);
+  const [dinov3Available, setDinov3Available] = createSignal<boolean>(true);
+  // dinov3 meta + job state from /api/dinov3/status. `meta` is non-null iff
+  // a prior run wrote meta.json for the current video. `job` reflects the
+  // most recent prepare invocation (running, errored, cancelled, etc.).
+  const [dinov3Status, setDinov3Status] = createSignal<{
+    meta: {
+      subsample_every?: number;
+      scaling?: number;
+      grid_width?: number;
+      grid_height?: number;
+      input_width?: number;
+      input_height?: number;
+      model?: string;
+    } | null;
+    job: {
+      running: boolean;
+      error: string | null;
+      cancelled?: boolean;
+      startedAt?: number;
+      finishedAt?: number;
+      progress?: string | null;
+      subsample?: number;
+      scaling?: number;
+    } | null;
+  } | null>(null);
+  // Per-video user input fields for the next dinov3 run. Persisted to
+  // localStorage so picks survive reloads when there's no saved meta yet;
+  // overridden by meta.json values whenever a video with stored results is
+  // loaded.
+  const [dinov3Subsample, setDinov3Subsample] = createSignal<string>(
+    localStorage.getItem("segviewer:dinov3Subsample") ?? "2",
+  );
+  createEffect(() => localStorage.setItem("segviewer:dinov3Subsample", dinov3Subsample()));
+  const DINOV3_SCALING_OPTIONS = ["1", "0.75", "0.5", "0.25"] as const;
+  const [dinov3Scaling, setDinov3Scaling] = createSignal<string>(
+    (() => {
+      const stored = localStorage.getItem("segviewer:dinov3Scaling");
+      return stored && (DINOV3_SCALING_OPTIONS as readonly string[]).includes(stored) ? stored : "0.5";
+    })(),
+  );
+  createEffect(() => localStorage.setItem("segviewer:dinov3Scaling", dinov3Scaling()));
   const availablePlugins = () => {
     const set = availablePluginIds();
     return set ? SCENE_PLUGINS.filter((p) => set.has(p.id)) : SCENE_PLUGINS;
@@ -168,10 +210,10 @@ export default function App() {
   const sam3DisabledReason = () => sam3Available() ? null
     : `SAM3 weights not installed (expected models/weights/sam3.pt). ${SAM_INSTALL_HINT}`;
   let scenePollTimer: number | undefined;
-  type ViewTab = "source" | "depth" | "3d" | "3d-scene" | "3d-object";
+  type ViewTab = "source" | "depth" | "3d" | "3d-scene" | "3d-object" | "dinov3";
   const storedTab = localStorage.getItem("segviewer:viewTab") as ViewTab | null;
   const [viewTab, setViewTab] = createSignal<ViewTab>(
-    storedTab && ["source", "depth", "3d", "3d-scene", "3d-object"].includes(storedTab) ? storedTab : "source"
+    storedTab && ["source", "depth", "3d", "3d-scene", "3d-object", "dinov3"].includes(storedTab) ? storedTab : "source"
   );
   const [showSourceMask, setShowSourceMask] = createSignal(
     localStorage.getItem("segviewer:showSourceMask") !== "false"
@@ -265,6 +307,45 @@ export default function App() {
     [1, 2, 4].includes(storedMeshSub) ? storedMeshSub : 4,
   );
   createEffect(() => localStorage.setItem("segviewer:meshSubsample", String(meshSubsample())));
+  // Bumped after a successful DinoV3 run so DinoV3Viewer drops its
+  // in-memory feature cache and cache-busts its meta + .npz HTTP fetches.
+  // Kept separate from `dataVersion` so a dinov3 re-run doesn't make
+  // ThreeDepthViewer refetch its depth maps for no reason.
+  const [dinov3DataVersion, setDinov3DataVersion] = createSignal<number>(0);
+  // Bumped by the Reset button in the dinov3 toolbar to discard the
+  // captured-feature set inside DinoV3Viewer.
+  const [dinov3ResetVersion, setDinov3ResetVersion] = createSignal<number>(0);
+  // DinoV3 heatmap opacity (0..1); slider lives in the dinov3 tab toolbar.
+  // 0 = image only, 1 = heatmap only (image fully hidden).
+  const storedDinoOpacity = Number(localStorage.getItem("segviewer:dinov3Opacity"));
+  const [dinov3Opacity, setDinov3Opacity] = createSignal<number>(
+    Number.isFinite(storedDinoOpacity) && storedDinoOpacity >= 0 && storedDinoOpacity <= 1
+      ? storedDinoOpacity
+      : 0.75,
+  );
+  createEffect(() => localStorage.setItem("segviewer:dinov3Opacity", String(dinov3Opacity())));
+  // DinoV3 visualization mode: "heatmap" (viridis on normalized cosine sim)
+  // or "contour" (binary mask of patches above the threshold). Persisted.
+  const storedDinoMode = localStorage.getItem("segviewer:dinov3Mode");
+  const [dinov3Mode, setDinov3Mode] = createSignal<"heatmap" | "contour">(
+    storedDinoMode === "contour" ? "contour" : "heatmap",
+  );
+  createEffect(() => localStorage.setItem("segviewer:dinov3Mode", dinov3Mode()));
+  // Cosine-sim threshold for contour mode (0..1). Patches at or above this
+  // are filled in the overlay color; below are transparent. (The viewer's
+  // scoring also subtracts a max-negative term, but negatives are currently
+  // unreachable from the UI, so the score stays in [0, 1] in practice.)
+  const storedDinoThr = Number(localStorage.getItem("segviewer:dinov3Threshold"));
+  const [dinov3Threshold, setDinov3Threshold] = createSignal<number>(
+    Number.isFinite(storedDinoThr) && storedDinoThr >= 0 && storedDinoThr <= 1
+      ? storedDinoThr
+      : 0.5,
+  );
+  createEffect(() => localStorage.setItem("segviewer:dinov3Threshold", String(dinov3Threshold())));
+  // Mirror of DinoV3Viewer's loaded meta, pushed up via onMeta. Drives the
+  // dinov3-tab Patch Grid readout and snaps the timeline slider to the
+  // subsampled frames that actually have features on disk.
+  const [dinov3Meta, setDinov3Meta] = createSignal<DinoV3Meta | null>(null);
   let threeViewerActions: { snapCamera: () => void; fitAll: () => void } | null = null;
   const [savedWorldUp, setSavedWorldUp] = createSignal<{ x: number; y: number; frame: number }[]>([]);
   const [worldUpId, setWorldUpId] = createSignal<string>("");
@@ -316,6 +397,7 @@ export default function App() {
         }
         setSam2Available(Boolean(data.sam2));
         setSam3Available(Boolean(data.sam3));
+        setDinov3Available(Boolean(data.dinov3));
       }
     } catch {}
     await refreshVideoList();
@@ -381,6 +463,7 @@ export default function App() {
     gpuTimer = window.setInterval(tick, 2000);
   });
   onCleanup(() => { if (gpuTimer !== undefined) clearInterval(gpuTimer); });
+  onCleanup(() => { if (dinov3PollTimer !== undefined) clearInterval(dinov3PollTimer); });
 
   // Persist UI state to localStorage
   createEffect(() => localStorage.setItem("segviewer:sceneSource", sceneSource()));
@@ -514,6 +597,11 @@ export default function App() {
   // current (analysis, source) combo.
   createEffect(() => {
     if (viewTab() === "3d-object" && !objectPointmapReady()) setViewTab("3d");
+  });
+  // Fall back from the "DinoV3" tab when the active video has no features
+  // on disk (e.g. just loaded a different video, or outputs were wiped).
+  createEffect(() => {
+    if (viewTab() === "dinov3" && dinov3Status()?.meta == null) setViewTab("source");
   });
   // Refetch object-cloud state when the active scene source or analysis
   // changes — each (analysis, source) pair has its own .npz file.
@@ -1124,6 +1212,148 @@ export default function App() {
     const _canvas = depthCanvas();
     if (_tab === "depth" && _canvas) renderDepthFrame();
   });
+
+  // Poll handle for dinov3 status updates while a job is running.
+  let dinov3PollTimer: number | undefined;
+
+  async function refreshDinov3Status(video: string) {
+    try {
+      const res = await fetch(`/api/dinov3/status?video=${encodeURIComponent(video)}`);
+      if (!res.ok) { setDinov3Status(null); return; }
+      const data = await res.json();
+      setDinov3Status(data);
+      // Sync the input fields from meta.json so the dropdowns reflect what
+      // was actually computed. Only writes when the meta value is valid;
+      // doesn't clobber a user-edited input that has since diverged.
+      const meta = data?.meta;
+      if (meta) {
+        if (typeof meta.subsample_every === "number" && meta.subsample_every > 0) {
+          setDinov3Subsample(String(meta.subsample_every));
+        }
+        if (typeof meta.scaling === "number") {
+          // Snap to the nearest preset so the dropdown shows the correct
+          // option even if the value was hand-edited slightly off.
+          const closest = (DINOV3_SCALING_OPTIONS as readonly string[]).reduce((best, o) =>
+            Math.abs(Number(o) - meta.scaling!) < Math.abs(Number(best) - meta.scaling!) ? o : best,
+          );
+          setDinov3Scaling(closest);
+        }
+      }
+      // Poll while running; clear once the backend reports done.
+      const running = Boolean(data?.job?.running);
+      if (running) {
+        if (dinov3PollTimer === undefined) {
+          dinov3PollTimer = window.setInterval(() => {
+            const v = videoName();
+            if (v) refreshDinov3Status(v);
+          }, 2000);
+        }
+        const detail = data?.job?.progress?.trim() || "Detecting features";
+        setStatus(`DinoV3: ${detail}`);
+      } else if (dinov3PollTimer !== undefined) {
+        clearInterval(dinov3PollTimer);
+        dinov3PollTimer = undefined;
+        if (data?.job) {
+          if (data.job.error) {
+            setStatus(`DinoV3 failed: ${data.job.error}`);
+          } else if (data.job.cancelled) {
+            // The cancel handler already set a status.
+          } else {
+            const elapsed = data.job.startedAt && data.job.finishedAt
+              ? formatElapsed((data.job.finishedAt - data.job.startedAt) / 1000)
+              : null;
+            setStatus(elapsed ? `DinoV3 features computed in ${elapsed}` : "DinoV3 features computed");
+            // Force the viewer to drop its cached features + re-fetch
+            // meta.json so a new grid shape / scaling takes effect without
+            // a page reload.
+            setDinov3DataVersion((v) => v + 1);
+          }
+        }
+      }
+    } catch {
+      setDinov3Status(null);
+    }
+  }
+
+  // Refetch dinov3 status whenever the active video changes.
+  createEffect(() => {
+    const v = videoName();
+    if (v) refreshDinov3Status(v);
+    else setDinov3Status(null);
+  });
+
+  /** True iff the meta.json on disk was computed with the inputs the user
+   *  currently has selected. Drives the "green ready" button state. */
+  const dinov3ReadyMatches = () => {
+    const meta = dinov3Status()?.meta;
+    if (!meta) return false;
+    const wantSub = Math.max(1, Math.round(Number(dinov3Subsample())));
+    const wantDs = Number(dinov3Scaling());
+    if (meta.subsample_every !== wantSub) return false;
+    if (typeof meta.scaling !== "number" || Math.abs(meta.scaling - wantDs) > 1e-6) return false;
+    return true;
+  };
+
+  async function runDinov3() {
+    const v = videoName();
+    if (!v) return;
+    const subN = Math.max(1, Math.round(Number(dinov3Subsample())));
+    const ds = Number(dinov3Scaling());
+    if (!Number.isFinite(ds) || ds <= 0) {
+      setStatus("DinoV3: pick a valid scaling");
+      return;
+    }
+    // Optimistically reflect "running" so the button flips without waiting
+    // for the next poll cycle.
+    setDinov3Status({
+      meta: dinov3Status()?.meta ?? null,
+      job: { running: true, error: null, startedAt: Date.now(), progress: null, subsample: subN, scaling: ds },
+    });
+    setStatus("Starting DinoV3 features...");
+    try {
+      const res = await fetch("/api/dinov3/prepare", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ video: v, subsample: subN, scaling: ds }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setStatus(`DinoV3 failed: ${data.error}`);
+        await refreshDinov3Status(v);
+        return;
+      }
+      refreshDinov3Status(v);
+    } catch (err: any) {
+      setStatus(`DinoV3 error: ${err.message ?? err}`);
+      await refreshDinov3Status(v);
+    }
+  }
+
+  async function cancelDinov3() {
+    const v = videoName();
+    if (!v) return;
+    setStatus("Cancelling DinoV3…");
+    // Optimistically flip — DELETE waits for the child process to exit.
+    const cur = dinov3Status();
+    if (cur?.job) {
+      setDinov3Status({ ...cur, job: { ...cur.job, running: false, cancelled: true } });
+    }
+    try {
+      const r = await fetch(`/api/dinov3/prepare?video=${encodeURIComponent(v)}`, { method: "DELETE" });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setStatus(`Cancel failed: ${data.error ?? r.statusText}`);
+      } else if (data.exited === false) {
+        setStatus("Cancel sent but DinoV3 did not exit — check log");
+      } else {
+        setStatus("DinoV3 cancelled");
+      }
+    } catch (e: any) {
+      setStatus(`Cancel error: ${e.message}`);
+    } finally {
+      await refreshDinov3Status(v);
+    }
+  }
 
   async function refreshSceneStatus(video: string) {
     try {
@@ -2023,6 +2253,105 @@ export default function App() {
               </button>
             </div>
 
+            {/* Features (DinoV3 dense patch features) */}
+            <div style={{ padding: "12px 16px" }}>
+              <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
+                Features
+              </div>
+              <div
+                style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
+                title="Use every Nth extracted frame as input to DinoV3. Higher N = faster + less disk but coarser temporal coverage."
+              >
+                <label style={{ "font-size": "11px", color: "#aaa" }}>Subsample every</label>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={dinov3Subsample()}
+                  onInput={(e) => setDinov3Subsample(e.currentTarget.value)}
+                  style={{
+                    width: "60px",
+                    padding: "4px 6px",
+                    background: "#0a0e1a",
+                    border: "1px solid #0f3460",
+                    color: "#e0e0e0",
+                    "border-radius": "3px",
+                    "font-size": "12px",
+                    "font-family": "inherit",
+                  }}
+                />
+                <span style={{ "font-size": "11px", color: "#888" }}>frames</span>
+              </div>
+              <div
+                style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
+                title="Resize each frame to this fraction of source resolution before patching. 100% = full source size. Smaller = faster + smaller files but coarser patch grid. Each axis is rounded to a multiple of 16."
+              >
+                <label style={{ "font-size": "11px", color: "#aaa" }}>Scaling</label>
+                <select
+                  value={dinov3Scaling()}
+                  onChange={(e) => setDinov3Scaling(e.currentTarget.value)}
+                  style={{
+                    padding: "4px 6px",
+                    background: "#0a0e1a",
+                    border: "1px solid #0f3460",
+                    color: "#e0e0e0",
+                    "border-radius": "3px",
+                    "font-size": "12px",
+                    "font-family": "inherit",
+                    cursor: "pointer",
+                  }}
+                >
+                  <For each={DINOV3_SCALING_OPTIONS}>
+                    {(o) => <option value={o}>{Number(o) * 100}%</option>}
+                  </For>
+                </select>
+              </div>
+              {(() => {
+                const running = () => Boolean(dinov3Status()?.job?.running);
+                const ready = () => dinov3ReadyMatches();
+                const [hovered, setHovered] = createSignal(false);
+                const disabled = () => !videoSrc() || !dinov3Available();
+                const tip = () => {
+                  if (!dinov3Available()) {
+                    return "DinoV3 is not installed. Run `python setup/plugin_dinov3.py` from the project root (requires Hugging Face access to facebook/dinov3-vitl16-pretrain-lvd1689m) and refresh.";
+                  }
+                  if (running()) return "Click to cancel the running DinoV3 feature run";
+                  if (ready()) {
+                    const m = dinov3Status()!.meta!;
+                    return `DinoV3 features ready (grid ${m.grid_width}×${m.grid_height}, subsample=${m.subsample_every}, scaling=${m.scaling}). Click to re-run; current outputs will be wiped first.`;
+                  }
+                  const m = dinov3Status()?.meta;
+                  if (m) {
+                    return `Stored result was computed with subsample=${m.subsample_every}, scaling=${m.scaling} — current selection differs. Click to re-run with the new options.`;
+                  }
+                  return "Run DinoV3 ViT-L/16 on every Nth frame, producing dense patch features (fp16 .npz per frame) under analysis/<video>/_scene/dinov3/.";
+                };
+                return (
+                  <button
+                    style={running()
+                      ? { ...cancellableRunningStyle(), width: "100%" }
+                      : { ...accentBtnStyle(!disabled(), ready()), width: "100%" }}
+                    onMouseEnter={() => setHovered(true)}
+                    onMouseLeave={() => setHovered(false)}
+                    onClick={() => (running() ? cancelDinov3() : runDinov3())}
+                    disabled={!running() && disabled()}
+                    title={tip()}
+                  >
+                    {running()
+                      ? "Running... (Click to Cancel)"
+                      : ready()
+                        ? (hovered() ? "Re-Run Features" : "Features Ready")
+                        : "Detect Features (DinoV3)"}
+                  </button>
+                );
+              })()}
+              <Show when={dinov3Status()?.job?.error}>
+                <div style={{ "font-size": "11px", color: "#e94560", "margin-top": "4px" }}>
+                  error: {dinov3Status()!.job!.error}
+                </div>
+              </Show>
+            </div>
+
             {/* Object Segmentation */}
             <div style={{ padding: "12px 16px" }}>
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
@@ -2319,11 +2648,12 @@ export default function App() {
           {/* Tab bar */}
           <Show when={videoSrc()}>
             <div style={{ display: "flex", background: "#16213e", "border-bottom": "1px solid #0f3460" }}>
-              <For each={[["source", "Source"], ["depth", "Depth"], ["3d", "3D (Per-Frame)"], ["3d-scene", "3D (Scene)"], ["3d-object", "3D (Object)"]] as [ViewTab, string][]}>
+              <For each={[["source", "Source"], ["depth", "Depth"], ["3d", "3D (Per-Frame)"], ["3d-scene", "3D (Scene)"], ["3d-object", "3D (Object)"], ["dinov3", "DinoV3"]] as [ViewTab, string][]}>
                 {([id, label]) => (
                   <Show when={
                     (id !== "3d-scene" || !!SCENE_PLUGINS_BY_ID[sceneSource()]?.features?.scenePointmap)
                     && (id !== "3d-object" || objectPointmapReady())
+                    && (id !== "dinov3" || dinov3Status()?.meta != null)
                   }>
                     <button
                       onClick={() => setViewTab(id)}
@@ -2451,6 +2781,35 @@ export default function App() {
                   );
                 })()}
               </Show>
+              <Show when={viewTab() === "dinov3"}>
+                <div
+                  style={{
+                    "margin-left": "auto",
+                    display: "flex",
+                    gap: "8px",
+                    "align-items": "center",
+                    "margin-right": "8px",
+                    color: "#aaa",
+                    "font-size": "10px",
+                    "font-family": "inherit",
+                  }}
+                >
+                  <span title="Heatmap opacity over the frame image. 0% = image only, 100% = heatmap only.">Heatmap</span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    value={dinov3Opacity()}
+                    onInput={(e) => setDinov3Opacity(Number(e.currentTarget.value))}
+                    style={{ width: "140px", cursor: "pointer" }}
+                    title="Heatmap opacity over the frame image. 0% = image only, 100% = heatmap only."
+                  />
+                  <span style={{ width: "32px", "text-align": "right" }}>
+                    {Math.round(dinov3Opacity() * 100)}%
+                  </span>
+                </div>
+              </Show>
             </div>
           </Show>
 
@@ -2510,6 +2869,95 @@ export default function App() {
                     </div>
                   </Show>
                 </Show>
+              </Show>
+              {/* DinoV3 dense-patch cosine-sim viewer — always mounted so its
+                  per-frame feature cache survives tab switches. */}
+              <DinoV3Viewer
+                videoName={videoName()}
+                currentFrame={currentFrame()}
+                visible={viewTab() === "dinov3"}
+                heatmapOpacity={dinov3Opacity()}
+                dataVersion={dinov3DataVersion()}
+                resetVersion={dinov3ResetVersion()}
+                mode={dinov3Mode()}
+                threshold={dinov3Threshold()}
+                onMeta={setDinov3Meta}
+              />
+              {/* DinoV3 right-side control panel: viz mode + (contour) threshold + reset. */}
+              <Show when={viewTab() === "dinov3"}>
+                <div
+                  style={{
+                    position: "absolute",
+                    right: "16px",
+                    top: "16px",
+                    background: "rgba(20, 20, 20, 0.85)",
+                    border: "1px solid #333",
+                    "border-radius": "6px",
+                    padding: "12px",
+                    display: "flex",
+                    "flex-direction": "column",
+                    gap: "10px",
+                    "min-width": "180px",
+                    color: "#e0e0e0",
+                    "font-size": "10px",
+                    "font-family": "inherit",
+                    "z-index": "15",
+                  }}
+                >
+                  <label style={{ display: "flex", "flex-direction": "column", gap: "4px" }}>
+                    <span style={{ color: "#aaa" }}>Mode</span>
+                    <select
+                      value={dinov3Mode()}
+                      onChange={(e) => setDinov3Mode(e.currentTarget.value === "contour" ? "contour" : "heatmap")}
+                      style={{
+                        padding: "3px 4px",
+                        background: "#0f3460",
+                        border: "1px solid #0f3460",
+                        "border-radius": "3px",
+                        color: "#e0e0e0",
+                        "font-size": "10px",
+                        "font-family": "inherit",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <option value="heatmap">Heatmap</option>
+                      <option value="contour">Contour</option>
+                    </select>
+                  </label>
+                  <Show when={dinov3Mode() === "contour"}>
+                    <label style={{ display: "flex", "flex-direction": "column", gap: "4px" }}>
+                      <span style={{ color: "#aaa" }}>
+                        Threshold <span style={{ color: "#e0e0e0" }}>{dinov3Threshold().toFixed(2)}</span>
+                      </span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.01"
+                        value={dinov3Threshold()}
+                        onInput={(e) => setDinov3Threshold(Number(e.currentTarget.value))}
+                        style={{ width: "100%", cursor: "pointer" }}
+                        title="Cosine-sim cutoff: patches at or above are filled, below are transparent."
+                      />
+                    </label>
+                  </Show>
+                  <button
+                    onClick={() => setDinov3ResetVersion(dinov3ResetVersion() + 1)}
+                    title="Discard the captured feature set"
+                    style={{
+                      padding: "4px 8px",
+                      background: "#0f3460",
+                      border: "1px solid #0f3460",
+                      "border-radius": "3px",
+                      color: "#e0e0e0",
+                      "font-size": "10px",
+                      "font-family": "inherit",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Reset features
+                  </button>
+                </div>
               </Show>
               {/* 3D view — always mounted, hidden via CSS */}
               <ThreeDepthViewer
@@ -2781,7 +3229,7 @@ export default function App() {
                     "z-index": "10",
                   }}
                 >
-                  {getScenePluginOrDefault(sceneSource()).label}
+                  {viewTab() === "dinov3" ? "DinoV3" : getScenePluginOrDefault(sceneSource()).label}
                 </div>
               </Show>
               {/* Drop overlay when dragging over video */}
@@ -2820,7 +3268,27 @@ export default function App() {
                   max={duration()}
                   step="0.001"
                   value={currentTime()}
-                  onInput={(e) => seek(parseFloat(e.currentTarget.value))}
+                  onInput={(e) => {
+                    const t = parseFloat(e.currentTarget.value);
+                    // On the dinov3 tab, snap to the nearest frame that
+                    // actually has features on disk — scrubbing between
+                    // subsampled frames would just show the same frame.
+                    if (viewTab() === "dinov3") {
+                      const m = dinov3Meta();
+                      if (m && m.frame_indices.length > 0) {
+                        const targetFrame = t * fps();
+                        let best = m.frame_indices[0];
+                        let bestDist = Math.abs(targetFrame - best);
+                        for (let i = 1; i < m.frame_indices.length; i++) {
+                          const d = Math.abs(targetFrame - m.frame_indices[i]);
+                          if (d < bestDist) { best = m.frame_indices[i]; bestDist = d; }
+                        }
+                        seek(best / fps());
+                        return;
+                      }
+                    }
+                    seek(t);
+                  }}
                   style={{ flex: "1", cursor: "pointer", "accent-color": "#e94560" }}
                 />
               </div>
@@ -2848,6 +3316,9 @@ export default function App() {
                           <span>Points: {(objectPmPoints()! / 1_000_000).toFixed(2)}m</span>
                         </Show>
                         <span>Resolution: {size ? `${size.w}x${size.h}` : "—"}</span>
+                        <Show when={tab === "dinov3" && dinov3Meta()}>
+                          {(m) => <span>Patch Grid: {m().grid_width}x{m().grid_height}</span>}
+                        </Show>
                         <Show when={kfCount !== null}>
                           <span>Keyframes: {kfCount}</span>
                         </Show>

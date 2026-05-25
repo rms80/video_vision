@@ -60,6 +60,22 @@ type ObjectPointmapJobState = {
 // key: `${video}::${analysis}::${source}` — one job per (analysis, source) pair
 const objectPointmapJobs = new Map<string, ObjectPointmapJobState>();
 
+type DinoV3JobState = {
+  video: string;
+  running: boolean;
+  error: string | null;
+  cancelled?: boolean;
+  startedAt: number;
+  finishedAt?: number;
+  progress?: string | null;
+  // Echo of the inputs so the UI can tell whether on-disk meta matches the
+  // last request even before the run completes.
+  subsample: number;
+  scaling: number;
+};
+const dinov3Jobs = new Map<string, DinoV3JobState>();           // key: video filename
+const dinov3ActiveJobs = new Map<string, CancellableJob>();    // key: video filename
+
 // Live child processes that support cancellation. The cancel endpoint
 // looks up the entry by key, sets `killed=true`, and tears down the
 // process tree; the spawning request's await rejects, and the killed
@@ -484,12 +500,17 @@ function segViewerPlugin(): Plugin {
         for (const p of SCENE_PLUGINS) scenePlugins[p.id] = isAvailable(p.availability);
         const boxSolvers: Record<string, boolean> = {};
         for (const p of BOX_SOLVER_PLUGINS) boxSolvers[p.id] = isAvailable(p.availability);
+        const dinov3 = isAvailable({
+          paths: ["models/external/dinov3"],
+          hfRepos: ["facebook/dinov3-vitl16-pretrain-lvd1689m"],
+        });
         res.setHeader("Content-Type", "application/json");
         res.end(JSON.stringify({
           scenePlugins,
           boxSolvers,
           sam2: fs.existsSync(SAM2_WEIGHTS),
           sam3: fs.existsSync(SAM3_WEIGHTS),
+          dinov3,
         }));
       });
 
@@ -888,6 +909,153 @@ function segViewerPlugin(): Plugin {
         res.end(JSON.stringify({
           artifacts: sceneArtifactState(video),
           job: sceneJobs.get(video) ?? null,
+        }));
+      });
+
+      // POST   /api/dinov3/prepare  — start a DINOv3 feature run
+      //   body: { video, subsample?, scaling? }
+      // DELETE /api/dinov3/prepare?video=  — cancel a running job
+      server.middlewares.use("/api/dinov3/prepare", (req, res, next) => {
+        if (req.method === "DELETE") {
+          (async () => {
+            const url = new URL(req.url!, `http://${req.headers.host}`);
+            const video = url.searchParams.get("video");
+            res.setHeader("Content-Type", "application/json");
+            if (!video) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: "Missing video" }));
+              return;
+            }
+            const job = dinov3ActiveJobs.get(video);
+            if (!job) {
+              res.statusCode = 404;
+              res.end(JSON.stringify({ error: "No running dinov3 job for this video" }));
+              return;
+            }
+            console.log(`[dinov3] cancel requested for ${video}`);
+            const exited = await cancelJob(job, ":dinov3");
+            res.end(JSON.stringify({ ok: true, exited }));
+          })();
+          return;
+        }
+        if (req.method !== "POST") return next();
+        let body = "";
+        req.on("data", (c: Buffer) => (body += c.toString()));
+        req.on("end", async () => {
+          try {
+            const { video, subsample, scaling } = JSON.parse(body || "{}");
+            if (!video) {
+              res.statusCode = 400;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: "Missing video" }));
+              return;
+            }
+            const videoPath = path.join(UPLOADS_DIR, video);
+            if (!fs.existsSync(videoPath)) {
+              res.statusCode = 404;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: "Video not found" }));
+              return;
+            }
+            const existing = dinov3Jobs.get(video);
+            if (existing && existing.running) {
+              res.statusCode = 409;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: "dinov3 already running", state: existing }));
+              return;
+            }
+            const sd = sceneDir(video);
+            fs.mkdirSync(sd, { recursive: true });
+            // Bootstrap frames if /api/upload's extract step failed previously.
+            if (!fs.existsSync(path.join(sd, "frames.json"))) {
+              await runPython(
+                path.join(SCRIPTS_DIR, "extract_frames.py"),
+                [videoPath, sd],
+                path.join(sd, "extract_frames.log"),
+              );
+            }
+            const subN = Math.max(1, Math.round(Number(subsample) || 2));
+            const scN = Number.isFinite(Number(scaling)) ? Number(scaling) : 0.5;
+            // Wipe prior output so a partial/failed previous run can't be
+            // mistaken for ready.
+            const outDir = path.join(sd, "dinov3");
+            if (fs.existsSync(outDir)) fs.rmSync(outDir, { recursive: true, force: true });
+            const logPath = path.join(sd, "dinov3.log");
+            const state: DinoV3JobState = {
+              video,
+              running: true,
+              error: null,
+              startedAt: Date.now(),
+              progress: null,
+              subsample: subN,
+              scaling: scN,
+            };
+            dinov3Jobs.set(video, state);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ ok: true, state }));
+
+            (async () => {
+              let stepJob: CancellableJob | null = null;
+              try {
+                await runPython(
+                  path.join(SCRIPTS_DIR, "run_dinov3.py"),
+                  [sd, "--subsample", String(subN), "--scaling", String(scN)],
+                  logPath,
+                  undefined,
+                  (proc) => {
+                    stepJob = { proc, killed: false };
+                    dinov3ActiveJobs.set(video, stepJob);
+                  },
+                  (msg) => { state.progress = msg; },
+                );
+                console.log(`[dinov3] ${video}: done`);
+              } catch (err: any) {
+                if (stepJob && (stepJob as CancellableJob).killed) {
+                  state.cancelled = true;
+                  console.log(`[dinov3] ${video}: cancelled`);
+                } else {
+                  state.error = err?.message ?? String(err);
+                  console.error(`[dinov3] ${video}: ${state.error}`);
+                }
+              } finally {
+                state.running = false;
+                state.finishedAt = Date.now();
+                state.progress = null;
+                if (stepJob && dinov3ActiveJobs.get(video) === stepJob) {
+                  dinov3ActiveJobs.delete(video);
+                }
+              }
+            })();
+          } catch (err: any) {
+            res.statusCode = 500;
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ error: err?.message ?? String(err) }));
+          }
+        });
+      });
+
+      // GET /api/dinov3/status?video=<filename>
+      // Returns: { meta: <meta.json contents or null>, job: <DinoV3JobState or null> }
+      server.middlewares.use("/api/dinov3/status", (req, res, next) => {
+        if (req.method !== "GET") return next();
+        const url = new URL(req.url!, `http://${req.headers.host}`);
+        const video = url.searchParams.get("video");
+        res.setHeader("Content-Type", "application/json");
+        if (!video) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: "Missing video" }));
+          return;
+        }
+        const sd = sceneDir(video);
+        const metaPath = path.join(sd, "dinov3", "meta.json");
+        let meta: unknown = null;
+        if (fs.existsSync(metaPath)) {
+          try { meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")); }
+          catch { meta = null; }
+        }
+        res.end(JSON.stringify({
+          meta,
+          job: dinov3Jobs.get(video) ?? null,
         }));
       });
 
@@ -1662,7 +1830,11 @@ function segViewerPlugin(): Plugin {
       // Serve per-frame track mask PNGs: /analysis/<stem>/<runName>/masks/<NNNNNN>.png
       // Also serves any other file under analysis/ (useful for debug).
       server.middlewares.use("/analysis", (req, res, next) => {
-        const rel = decodeURIComponent(req.url?.replace(/^\//, "") ?? "");
+        // Strip any query string (e.g. ?v=<cache-bust>) before resolving
+        // against the filesystem; without this, callers using a cache-bust
+        // suffix get a 404 because we'd try to open `file.ext?v=1`.
+        const raw = req.url?.replace(/^\//, "").split("?")[0] ?? "";
+        const rel = decodeURIComponent(raw);
         if (!rel) return next();
         // Block path traversal
         const filepath = path.normalize(path.join(ANALYSIS_DIR, rel));
