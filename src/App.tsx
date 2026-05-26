@@ -18,6 +18,13 @@ import {
 /** Show the active scene-analysis plugin name overlaid on the right viewport. */
 const SHOW_SCENE_NAME_OVERLAY = true;
 
+/** Gates the depth-tab click-drag color-rescale UI (the drawable line + its
+ *  control panel). Disabled for now — the interaction was removed, but the
+ *  underlying dynamic-rescale support (depthRange → colormap) is kept intact
+ *  so it can be driven again later. Flip to re-enable the canvas wiring and
+ *  the panel together. */
+const DEPTH_RANGE_UI_ENABLED = false;
+
 /** Compact human-readable duration: `0.4s`, `12s`, `1m 23s`, `1h 4m`. */
 function formatElapsed(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) return "0s";
@@ -31,6 +38,15 @@ function formatElapsed(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   return `${h}h ${m}m`;
+}
+
+/** Compact depth-value readout: a few significant digits, scientific only for
+ *  very small/large magnitudes. Returns "—" for missing/non-finite values. */
+function formatDepth(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  const a = Math.abs(v);
+  if (a !== 0 && (a < 0.01 || a >= 10000)) return v.toExponential(2);
+  return v.toFixed(a < 1 ? 4 : a < 100 ? 2 : 1);
 }
 
 /** Viridis colormap (256 entries) — [r,g,b] each 0–255 */
@@ -228,6 +244,17 @@ export default function App() {
   const [depthStem, setDepthStem] = createSignal<string>("");
   const [depthCanvas, setDepthCanvas] = createSignal<HTMLCanvasElement | null>(null);
   const [depthLoading, setDepthLoading] = createSignal(false);
+  // Depth color-map override set by click-dragging a line on the depth map:
+  // the colormap is rescaled so depth at the two endpoints spans the full
+  // viridis ramp. null = auto per-frame min/max. Cleared by the Reset button
+  // and whenever the depth source changes (refreshDepthFrames).
+  const [depthRange, setDepthRange] = createSignal<{ min: number; max: number } | null>(null);
+  // The drawn line, in depth-map pixel coordinates, plus the depth sampled at
+  // each endpoint (d1=start, d2=end). Kept for the on-canvas overlay and the
+  // control-panel readout. null when no line is active.
+  const [depthDrag, setDepthDrag] = createSignal<
+    { x1: number; y1: number; x2: number; y2: number; d1: number | null; d2: number | null } | null
+  >(null);
   const [settingFloor, setSettingFloor] = createSignal(false);
   const [floorPoints, setFloorPoints] = createSignal<{ x: number; y: number; frame: number }[]>([]);
   const [aligning, setAligning] = createSignal(false);
@@ -317,13 +344,18 @@ export default function App() {
   const [dinov3ResetVersion, setDinov3ResetVersion] = createSignal<number>(0);
   // DinoV3 heatmap opacity (0..1); slider lives in the dinov3 tab toolbar.
   // 0 = image only, 1 = heatmap only (image fully hidden).
-  const storedDinoOpacity = Number(localStorage.getItem("segviewer:dinov3Opacity"));
+  // NB: read the raw string first — a missing key returns null, and
+  // Number(null) === 0 would pass the range check and clobber the 0.75
+  // default (then the effect below persists that 0). Key is :v2 to discard
+  // any 0 written by the earlier buggy version.
+  const storedDinoOpacityRaw = localStorage.getItem("segviewer:dinov3Opacity:v2");
+  const storedDinoOpacity = storedDinoOpacityRaw === null ? NaN : Number(storedDinoOpacityRaw);
   const [dinov3Opacity, setDinov3Opacity] = createSignal<number>(
     Number.isFinite(storedDinoOpacity) && storedDinoOpacity >= 0 && storedDinoOpacity <= 1
       ? storedDinoOpacity
       : 0.75,
   );
-  createEffect(() => localStorage.setItem("segviewer:dinov3Opacity", String(dinov3Opacity())));
+  createEffect(() => localStorage.setItem("segviewer:dinov3Opacity:v2", String(dinov3Opacity())));
   // DinoV3 visualization mode: "heatmap" (viridis on normalized cosine sim)
   // or "contour" (binary mask of patches above the threshold). Persisted.
   const storedDinoMode = localStorage.getItem("segviewer:dinov3Mode");
@@ -335,13 +367,17 @@ export default function App() {
   // are filled in the overlay color; below are transparent. (The viewer's
   // scoring also subtracts a max-negative term, but negatives are currently
   // unreachable from the UI, so the score stays in [0, 1] in practice.)
-  const storedDinoThr = Number(localStorage.getItem("segviewer:dinov3Threshold"));
+  // Same null-coercion guard as dinov3Opacity above: a missing key returns
+  // null, and Number(null) === 0 would pass the range check and clobber the
+  // default. Key is :v2 to discard any 0 the earlier buggy version persisted.
+  const storedDinoThrRaw = localStorage.getItem("segviewer:dinov3Threshold:v2");
+  const storedDinoThr = storedDinoThrRaw === null ? NaN : Number(storedDinoThrRaw);
   const [dinov3Threshold, setDinov3Threshold] = createSignal<number>(
     Number.isFinite(storedDinoThr) && storedDinoThr >= 0 && storedDinoThr <= 1
       ? storedDinoThr
       : 0.5,
   );
-  createEffect(() => localStorage.setItem("segviewer:dinov3Threshold", String(dinov3Threshold())));
+  createEffect(() => localStorage.setItem("segviewer:dinov3Threshold:v2", String(dinov3Threshold())));
   // Mirror of DinoV3Viewer's loaded meta, pushed up via onMeta. Drives the
   // dinov3-tab Patch Grid readout and snaps the timeline slider to the
   // subsampled frames that actually have features on disk.
@@ -1119,6 +1155,7 @@ export default function App() {
   async function refreshDepthFrames(video: string) {
     depthCache.clear();
     setCameras(null);
+    resetDepthRange();
     const source = sceneSource();
     try {
       const res = await fetch(`/api/depth-frames?video=${encodeURIComponent(video)}&source=${source}`);
@@ -1183,14 +1220,24 @@ export default function App() {
     canvas.height = height;
     const ctx = canvas.getContext("2d")!;
     const imgData = ctx.createImageData(width, height);
-    // Find min/max for normalization (skip non-finite)
-    let min = Infinity, max = -Infinity;
-    for (let i = 0; i < data.length; i++) {
-      const v = data[i];
-      if (Number.isFinite(v)) {
-        if (v < min) min = v;
-        if (v > max) max = v;
+    // Color range: an explicit override from a dragged line (depthRange),
+    // otherwise auto-normalize to this frame's finite min/max.
+    let min: number, max: number;
+    const override = depthRange();
+    if (override) {
+      min = override.min;
+      max = override.max;
+    } else {
+      min = Infinity;
+      max = -Infinity;
+      for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        if (Number.isFinite(v)) {
+          if (v < min) min = v;
+          if (v > max) max = v;
+        }
       }
+      if (!Number.isFinite(min)) { min = 0; max = 1; }
     }
     const range = max - min || 1;
     for (let i = 0; i < data.length; i++) {
@@ -1203,13 +1250,136 @@ export default function App() {
       imgData.data[i * 4 + 3] = 255;
     }
     ctx.putImageData(imgData, 0, 0);
+
+    // Overlay the rescale line + endpoint markers, if one is active. Sized in
+    // canvas pixels but scaled by the on-screen display factor so the line
+    // and dots stay a constant apparent thickness regardless of zoom.
+    const drag = depthDrag();
+    if (drag) {
+      const rect = canvas.getBoundingClientRect();
+      const scale = rect.width > 0 ? canvas.width / rect.width : 1;
+      ctx.lineWidth = 1.5 * scale;
+      ctx.strokeStyle = "rgba(255,255,255,0.95)";
+      ctx.shadowColor = "rgba(0,0,0,0.85)";
+      ctx.shadowBlur = 2 * scale;
+      ctx.beginPath();
+      ctx.moveTo(drag.x1 + 0.5, drag.y1 + 0.5);
+      ctx.lineTo(drag.x2 + 0.5, drag.y2 + 0.5);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      const rad = 3.5 * scale;
+      // start = green, end = red, matching the control-panel readout.
+      for (const [mx, my, fill] of [
+        [drag.x1, drag.y1, "#3ad29f"],
+        [drag.x2, drag.y2, "#e94560"],
+      ] as const) {
+        ctx.beginPath();
+        ctx.arc(mx + 0.5, my + 0.5, rad, 0, Math.PI * 2);
+        ctx.fillStyle = fill;
+        ctx.fill();
+        ctx.lineWidth = scale;
+        ctx.strokeStyle = "rgba(0,0,0,0.85)";
+        ctx.stroke();
+      }
+    }
   }
 
-  // Re-render depth when frame changes, tab switches, or canvas mounts
+  // ── Depth color-range drag interaction ──────────────────────────────────
+  // Pixel the most recent pointerdown landed on (depth-map coordinates).
+  let depthDragStart: { px: number; py: number } | null = null;
+  let depthDragging = false;
+
+  /** Map a pointer event to depth-map pixel coordinates. The canvas is shown
+   *  scaled to fit, so divide by the displayed rect rather than intrinsic size. */
+  function depthEventToPixel(e: PointerEvent): { px: number; py: number } | null {
+    const canvas = depthCanvas();
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const px = Math.round(((e.clientX - rect.left) / rect.width) * canvas.width);
+    const py = Math.round(((e.clientY - rect.top) / rect.height) * canvas.height);
+    return {
+      px: Math.max(0, Math.min(canvas.width - 1, px)),
+      py: Math.max(0, Math.min(canvas.height - 1, py)),
+    };
+  }
+
+  /** Sample the current frame's depth at a pixel, falling back to the nearest
+   *  finite neighbor (depth maps carry NaN holes at sky / invalid regions). */
+  function sampleDepthAt(px: number, py: number): number | null {
+    const frameIdx = nearestDepthFrame();
+    if (frameIdx == null) return null;
+    const cached = depthCache.get(frameIdx);
+    if (!cached) return null;
+    const { data, width, height } = cached;
+    const cx = Math.max(0, Math.min(width - 1, px));
+    const cy = Math.max(0, Math.min(height - 1, py));
+    const v = data[cy * width + cx];
+    if (Number.isFinite(v)) return v;
+    for (let r = 1; r <= 5; r++) {
+      for (let yy = cy - r; yy <= cy + r; yy++) {
+        for (let xx = cx - r; xx <= cx + r; xx++) {
+          if (xx < 0 || yy < 0 || xx >= width || yy >= height) continue;
+          const vv = data[yy * width + xx];
+          if (Number.isFinite(vv)) return vv;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Recompute the drawn line + color range from the stored start pixel to a
+   *  new end pixel. Called live on every drag move and on release. */
+  function updateDepthLine(end: { px: number; py: number }) {
+    const start = depthDragStart;
+    if (!start) return;
+    const d1 = sampleDepthAt(start.px, start.py);
+    const d2 = sampleDepthAt(end.px, end.py);
+    setDepthDrag({ x1: start.px, y1: start.py, x2: end.px, y2: end.py, d1, d2 });
+    if (d1 == null || d2 == null) return;
+    const lo = Math.min(d1, d2);
+    const hi = Math.max(d1, d2);
+    if (hi - lo > 1e-9) setDepthRange({ min: lo, max: hi });
+  }
+
+  function onDepthPointerDown(e: PointerEvent) {
+    const p = depthEventToPixel(e);
+    if (!p) return;
+    e.preventDefault();
+    depthDragging = true;
+    depthDragStart = p;
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    const d = sampleDepthAt(p.px, p.py);
+    setDepthDrag({ x1: p.px, y1: p.py, x2: p.px, y2: p.py, d1: d, d2: d });
+  }
+  function onDepthPointerMove(e: PointerEvent) {
+    if (!depthDragging) return;
+    const p = depthEventToPixel(e);
+    if (p) updateDepthLine(p);
+  }
+  function onDepthPointerUp(e: PointerEvent) {
+    if (!depthDragging) return;
+    depthDragging = false;
+    const p = depthEventToPixel(e);
+    if (p) updateDepthLine(p);
+    (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+  }
+  /** Discard the line + range override, restoring auto per-frame scaling. */
+  function resetDepthRange() {
+    depthDragStart = null;
+    depthDragging = false;
+    setDepthDrag(null);
+    setDepthRange(null);
+  }
+
+  // Re-render depth when frame changes, tab switches, canvas mounts, or the
+  // color range / drag line changes (the latter drives the live overlay).
   createEffect(() => {
     const _frame = currentFrame();
     const _tab = viewTab();
     const _canvas = depthCanvas();
+    const _range = depthRange();
+    const _drag = depthDrag();
     if (_tab === "depth" && _canvas) renderDepthFrame();
   });
 
@@ -2028,7 +2198,7 @@ export default function App() {
             {/* 3D Scene Analysis */}
             <div style={{ padding: "12px 16px" }}>
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
-                3D Scene Analysis
+                Per-Frame Depth & Cameras
               </div>
               <select
                 value={availablePlugins().length === 0 ? "" : sceneSource()}
@@ -2067,7 +2237,7 @@ export default function App() {
                   style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
                   title="Which scene plugin's cameras.json supplies the per-frame poses and intrinsics fed into this plugin. Only plugins with an existing analysis for this video show up here — run one of them first."
                 >
-                  <label style={{ "font-size": "11px", color: "#aaa" }}>Camera source</label>
+                  <label style={{ "font-size": "11px", color: "#aaa" }}>Source</label>
                   <select
                     value={effectiveCameraSource()}
                     disabled={cameraSourceOptions().length === 0}
@@ -2247,7 +2417,7 @@ export default function App() {
                 }}
                 onClick={alignScene}
                 disabled={(floorPoints().length < 3 && savedWorldUp().length < 3) || aligning()}
-                title="Apply a similarity transform that puts the picked floor at y=0 and rescales depth to metric units. Edits the active plugin's cameras.json in place. Required before 3D box lifting and mesh reconstruction give meaningful real-world coordinates."
+                title="Apply a similarity transform that puts the picked floor at y=0 and rescales depth to metric units. Edits the active plugin's cameras.json in place. Required before 3D box lifting and mesh reconstruction give meaningful real-world coordinates. (You must Set World-Up Bounds in the Annotation Tab for this to work)."
               >
                 {aligning() ? "Aligning..." : isAligned() ? "Aligned" : "Align Scene"}
               </button>
@@ -2256,7 +2426,7 @@ export default function App() {
             {/* Features (DinoV3 dense patch features) */}
             <div style={{ padding: "12px 16px" }}>
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
-                Features
+                Per-Frame Features (DinoV3)
               </div>
               <div
                 style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "6px" }}
@@ -2355,7 +2525,7 @@ export default function App() {
             {/* Object Segmentation */}
             <div style={{ padding: "12px 16px" }}>
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
-                Object Segmentation
+                Object Segmentation (SAMV2/V3)
               </div>
               <div
                 style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "8px" }}
@@ -2454,7 +2624,7 @@ export default function App() {
             {/* Object Placement */}
             <div style={{ padding: "12px 16px" }}>
               <div style={{ "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.5px", color: "#888", "margin-bottom": "8px" }}>
-                Object Placement
+                3D Object Bounds
               </div>
               <select
                 value={availableBoxSolvers().length === 0 ? "" : boxSolverId()}
@@ -2869,6 +3039,88 @@ export default function App() {
                     </div>
                   </Show>
                 </Show>
+              </Show>
+              {/* Depth right-side control panel: active color range + reset.
+                  Mirrors the DinoV3 panel below. Hidden via DEPTH_RANGE_UI_ENABLED
+                  for now (kept intact, not deleted). */}
+              <Show when={DEPTH_RANGE_UI_ENABLED && viewTab() === "depth" && depthFrames().length > 0}>
+                <div
+                  style={{
+                    position: "absolute",
+                    right: "16px",
+                    top: "16px",
+                    background: "rgba(20, 20, 20, 0.85)",
+                    border: "1px solid #333",
+                    "border-radius": "6px",
+                    padding: "12px",
+                    display: "flex",
+                    "flex-direction": "column",
+                    gap: "10px",
+                    "min-width": "180px",
+                    "max-width": "220px",
+                    color: "#e0e0e0",
+                    "font-size": "10px",
+                    "font-family": "inherit",
+                    "z-index": "15",
+                  }}
+                >
+                  <div style={{ color: "#aaa", "line-height": "1.45" }}>
+                    Click-drag a line on the depth map to rescale the color map
+                    between the depth at its two endpoints.
+                  </div>
+                  <div style={{ display: "flex", "flex-direction": "column", gap: "4px" }}>
+                    <span style={{ color: "#aaa" }}>Color range</span>
+                    <Show
+                      when={depthDrag()}
+                      fallback={<span>Auto (per-frame min/max)</span>}
+                    >
+                      {(d) => (
+                        <div
+                          style={{
+                            display: "flex",
+                            "flex-direction": "column",
+                            gap: "2px",
+                            "font-variant-numeric": "tabular-nums",
+                          }}
+                        >
+                          <span>
+                            <span style={{ color: "#3ad29f" }}>Start</span>{" "}
+                            {formatDepth(d().d1)}
+                          </span>
+                          <span>
+                            <span style={{ color: "#e94560" }}>End</span>{" "}
+                            {formatDepth(d().d2)}
+                          </span>
+                          <Show when={depthRange()}>
+                            {(r) => (
+                              <span style={{ color: "#888", "margin-top": "2px" }}>
+                                range {formatDepth(r().min)} – {formatDepth(r().max)}
+                              </span>
+                            )}
+                          </Show>
+                        </div>
+                      )}
+                    </Show>
+                  </div>
+                  <button
+                    onClick={resetDepthRange}
+                    disabled={!depthDrag() && !depthRange()}
+                    title="Restore automatic per-frame color scaling"
+                    style={{
+                      padding: "4px 8px",
+                      background: "#0f3460",
+                      border: "1px solid #0f3460",
+                      "border-radius": "3px",
+                      color: "#e0e0e0",
+                      "font-size": "10px",
+                      "font-family": "inherit",
+                      cursor: (depthDrag() || depthRange()) ? "pointer" : "default",
+                      opacity: (depthDrag() || depthRange()) ? 1 : 0.5,
+                    }}
+                  >
+                    Reset
+                  </button>
+                </div>
               </Show>
               {/* DinoV3 dense-patch cosine-sim viewer — always mounted so its
                   per-frame feature cache survives tab switches. */}
