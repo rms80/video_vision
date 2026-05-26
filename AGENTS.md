@@ -80,3 +80,11 @@ To start or restart the Vite dev server:
 Both free port 4444 (kill any existing listener) and run `npm run dev`.
 Don't `npm run dev` directly — `strictPort: true` means a stale listener
 on 4444 will fail the start.
+
+## Git commits
+
+Commits go through `git` invoked from a POSIX shell, **not** PowerShell.
+Do not use PowerShell here-string syntax (`@'...'@`) for commit messages —
+bash treats the `@` characters literally and they end up in the message.
+For multi-line messages use a bash heredoc or write the message to a temp
+file and pass it with `git commit -F <file>`.
